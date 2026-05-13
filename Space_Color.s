@@ -1,6 +1,7 @@
 @ ============================================================
 @ space_ship.s
-@ Nave espacial con GALAXIAS REALISTAS y PROPULSORES ANIMADOS
+@ Nave espacial con GALAXIAS REALISTAS, PROPULSORES ANIMADOS
+@ y MOVIMIENTO DE TURBULENCIA / INGRAVIDEZ.
 @ Movimiento con flechas del teclado (PS/2) por interrupciones
 @ ARMv7 - DE1-SoC / CPUlator
 @ ============================================================
@@ -14,7 +15,7 @@
 .equ C_YELLOW, 0xFFE0
 .equ C_GRAY,   0x4208
 
-@ Tamaño del sprite (aumentado el alto para el fuego)
+@ Tamaño del sprite
 .equ SHIP_W,  32
 .equ SHIP_H,  36
 
@@ -47,14 +48,22 @@ _start:
     @ ---- Pintar fondo (una sola vez) -----------------------
     BL   DRAW_BACKGROUND
 
-    @ ---- Inicializar posición y estados -------------------
+    @ ---- Inicializar posición (lógica y visual) -----------
+    LDR  R0, =logical_x
+    MOV  R1, #144
+    STR  R1, [R0]
+    LDR  R0, =logical_y
+    MOV  R1, #204
+    STR  R1, [R0]
+
     LDR  R0, =ship_x
     MOV  R1, #144
     STR  R1, [R0]
     LDR  R0, =ship_y
-    MOV  R1, #204               @ Ajustado por el nuevo SHIP_H
+    MOV  R1, #204
     STR  R1, [R0]
 
+    @ Estado de banderas y teclas en 0
     MOV  R1, #0
     LDR  R0, =key_up
     STR  R1, [R0]
@@ -64,6 +73,7 @@ _start:
     STR  R1, [R0]
     LDR  R0, =key_right
     STR  R1, [R0]
+
     LDR  R0, =e0_flag_ps2
     STR  R1, [R0]
     LDR  R0, =break_flag
@@ -71,6 +81,10 @@ _start:
     LDR  R0, =anim_frame
     STR  R1, [R0]
     LDR  R0, =redraw_flag
+    STR  R1, [R0]
+    LDR  R0, =turb_tick
+    STR  R1, [R0]
+    LDR  R0, =turb_phase
     STR  R1, [R0]
 
     @ ---- Guardar fondo y pintar nave por primera vez -------
@@ -90,7 +104,7 @@ _start:
 @ MAIN LOOP
 @ ============================================================
 MAIN_LOOP:
-    @ ---- Calcular dx ---------------------------------------
+    @ ---- Calcular dx del usuario ----
     LDR  R0, =key_right
     LDR  R0, [R0]
     LDR  R1, =key_left
@@ -98,7 +112,7 @@ MAIN_LOOP:
     SUB  R6, R0, R1             @ R6 = dir_x  (-1, 0, +1)
     LSL  R6, R6, #2             @ * STEP(4)
 
-    @ ---- Calcular dy ---------------------------------------
+    @ ---- Calcular dy del usuario ----
     LDR  R0, =key_down
     LDR  R0, [R0]
     LDR  R1, =key_up
@@ -106,23 +120,8 @@ MAIN_LOOP:
     SUB  R7, R0, R1             @ R7 = dir_y  (-1, 0, +1)
     LSL  R7, R7, #2             @ * STEP(4)
 
-    @ ---- Si hay movimiento ---------------------------------
-    ORRS R0, R6, R7
-    BNE  DO_MOVE
-
-    @ ---- Si no hay movimiento, revisar bandera del TIMER ---
-    LDR  R0, =redraw_flag
-    LDR  R1, [R0]
-    CMP  R1, #1
-    BEQ  DO_REDRAW_STATIC
-    B    MAIN_WAIT
-
-DO_MOVE:
-    @ Restaurar fondo viejo ANTES de mover variables
-    BL   RESTORE_BG
-
-    @ ---- Aplicar dx con clamping --------------------------
-    LDR  R0, =ship_x
+    @ ---- Actualizar Posición LÓGICA ------------------------
+    LDR  R0, =logical_x
     LDR  R4, [R0]
     ADD  R4, R4, R6
     CMP  R4, #0
@@ -132,8 +131,7 @@ DO_MOVE:
     MOVGT R4, R5
     STR  R4, [R0]
 
-    @ ---- Aplicar dy con clamping --------------------------
-    LDR  R0, =ship_y
+    LDR  R0, =logical_y
     LDR  R4, [R0]
     ADD  R4, R4, R7
     CMP  R4, #0
@@ -143,20 +141,83 @@ DO_MOVE:
     MOVGT R4, R5
     STR  R4, [R0]
 
-    @ Guardar fondo nuevo y repintar
+    @ ---- Calcular Posición VISUAL (Lógica + Turbulencia) ---
+    LDR  R0, =turb_phase
+    LDR  R0, [R0]
+    LSL  R0, R0, #2             @ Offset de 4 bytes para tabla
+
+    LDR  R1, =turb_off_x
+    LDR  R1, [R1, R0]
+    LDR  R2, =logical_x
+    LDR  R2, [R2]
+    ADD  R8, R2, R1             @ R8 = new_ship_x
+
+    LDR  R1, =turb_off_y
+    LDR  R1, [R1, R0]
+    LDR  R2, =logical_y
+    LDR  R2, [R2]
+    ADD  R9, R2, R1             @ R9 = new_ship_y
+
+    @ ---- Clamping de seguridad para evitar desbordes visuales
+    CMP  R8, #0
+    MOVLT R8, #0
+    LDR  R5, =320-SHIP_W
+    CMP  R8, R5
+    MOVGT R8, R5
+
+    CMP  R9, #0
+    MOVLT R9, #0
+    LDR  R5, =240-SHIP_H
+    CMP  R9, R5
+    MOVGT R9, R5
+
+    @ ---- Comprobar si la posición visual ha cambiado -------
+    LDR  R0, =ship_x
+    LDR  R4, [R0]
+    CMP  R4, R8
+    BNE  DO_REDRAW_MOVE
+
+    LDR  R0, =ship_y
+    LDR  R5, [R0]
+    CMP  R5, R9
+    BNE  DO_REDRAW_MOVE
+
+    @ ---- Si no hay movimiento, revisar bandera de animación -
+    LDR  R0, =redraw_flag
+    LDR  R1, [R0]
+    CMP  R1, #1
+    BEQ  DO_REDRAW_STATIC
+
+    B    MAIN_WAIT
+
+DO_REDRAW_MOVE:
+    @ Restaurar fondo viejo (usa las variables ship_x/y actuales)
+    BL   RESTORE_BG
+
+    @ Actualizar la posición visual a la nueva calculada
+    LDR  R0, =ship_x
+    STR  R8, [R0]
+    LDR  R0, =ship_y
+    STR  R9, [R0]
+
+    @ Guardar el nuevo bloque de fondo
     BL   SAVE_BG
-    LDR  R0, =redraw_flag       @ Limpiamos flag porque ya repintamos
+
+    @ Limpiar flag de animación, ya que vamos a dibujar
+    LDR  R0, =redraw_flag
     MOV  R1, #0
     STR  R1, [R0]
+
+    @ Dibujar nave
     BL   DRAW_SHIP
     B    MAIN_WAIT
 
 DO_REDRAW_STATIC:
-    @ Repintar solo para animar el fuego en el sitio actual
+    @ Repintar en la misma posición para cambiar frame del propulsor
     MOV  R1, #0
     STR  R1, [R0]               @ Limpiar flag de redibujo
-    BL   RESTORE_BG             @ Borrar nave (recuperando fondo limpio)
-    BL   DRAW_SHIP              @ Dibujar nave con nuevo propulsor
+    BL   RESTORE_BG             @ Borrar nave
+    BL   DRAW_SHIP              @ Dibujar nave con nuevo frame
     B    MAIN_WAIT
 
 MAIN_WAIT:
@@ -177,16 +238,14 @@ DELAY_LOOP:
 
 @ ============================================================
 @ DRAW_SHIP
-@ Dibuja la carcasa base de la nave, y luego escoge el frame
-@ del fuego dependiendo de anim_frame.
 @ ============================================================
 DRAW_SHIP:
     PUSH {R4-R10, LR}
     LDR  R4, =FB_BASE
     LDR  R5, =ship_x
-    LDR  R5, [R5]               @ x
+    LDR  R5, [R5]               @ x visual real
     LDR  R6, =ship_y
-    LDR  R6, [R6]               @ y
+    LDR  R6, [R6]               @ y visual real
 
     LSL  R7, R6, #10
     ADD  R7, R7, R5, LSL #1     @ R7 = base_offset
@@ -238,7 +297,6 @@ DS_DONE:
 
 @ ============================================================
 @ SAVE_BG / RESTORE_BG
-@ Modificados para SHIP_H = 36
 @ ============================================================
 SAVE_BG:
     PUSH {R4-R10, LR}
@@ -250,15 +308,15 @@ SAVE_BG:
 
     LSL  R7, R6, #10
     ADD  R7, R7, R5, LSL #1
-    ADD  R7, R7, R4
+    ADD  R7, R7, R4             @ R7 = puntero FB inicio
 
     LDR  R8, =bg_buffer
-    MOV  R9, #SHIP_H
+    MOV  R9, #SHIP_H            @ filas restantes
 SB_ROW:
     CMP  R9, #0
     BEQ  SB_DONE
-    MOV  R10, #SHIP_W
-    MOV  R0, R7
+    MOV  R10, #SHIP_W           @ cols restantes
+    MOV  R0, R7                 @ puntero a fila actual
 SB_COL:
     CMP  R10, #0
     BEQ  SB_NEXT
@@ -267,7 +325,7 @@ SB_COL:
     SUB  R10, R10, #1
     B    SB_COL
 SB_NEXT:
-    ADD  R7, R7, #1024
+    ADD  R7, R7, #1024          @ siguiente fila de la pantalla
     SUB  R9, R9, #1
     B    SB_ROW
 SB_DONE:
@@ -430,9 +488,7 @@ SET_IRQs:
 CONFIG_INTERVAL_TIMER:
     PUSH {LR}
     LDR  R0, =0xFF202000
-    @ Configurar para 5,000,000 ciclos = 0.05s (20 Hz) para buen parpadeo de fuego
-    @ 5,000,000 = 0x004C4B40
-    LDR  R1, =0x4B40
+    LDR  R1, =0x4B40            @ Timer a 20Hz (0.05s) para buen parpadeo
     STR  R1, [R0, #0x08]
     LDR  R1, =0x004C
     STR  R1, [R0, #0x0C]
@@ -507,28 +563,50 @@ EXIT_IRQ:
 
 @ ============================================================
 @ TIMER_ISR
-@ Actualiza el frame de animación y solicita un redibujo.
+@ Actualiza la animación de fuego y calcula la fase de turbulencia
 @ ============================================================
 .global TIMER_ISR
 TIMER_ISR:
     PUSH {R0-R2, LR}
     LDR  R0, =0xFF202000
     MOV  R1, #0
-    STR  R1, [R0]               @ Limpiar IRQ
+    STR  R1, [R0]               @ Limpiar IRQ Timer
 
-    @ Avanzar anim_frame (0 -> 1 -> 2 -> 0)
+    @ 1) Actualizar frame de propulsor
     LDR  R0, =anim_frame
     LDR  R1, [R0]
     ADD  R1, R1, #1
-    CMP  R1, #3
+    CMP  R1, #2
     MOVGE R1, #0
     STR  R1, [R0]
 
-    @ Notificar al MAIN_LOOP que hay que repintar
+    @ 2) Solicitar redibujo al loop principal
     LDR  R0, =redraw_flag
-    MOV  R2, #1
-    STR  R2, [R0]
+    MOV  R1, #1
+    STR  R1, [R0]
 
+    @ 3) Temporizador de turbulencia (cambia cada 5 ticks = 4Hz)
+    LDR  R0, =turb_tick
+    LDR  R1, [R0]
+    ADD  R1, R1, #1
+    CMP  R1, #3
+    BGE  TI_DO_TURB
+    STR  R1, [R0]               @ Guardar incremento y salir
+    B    TI_END
+
+TI_DO_TURB:
+    MOV  R1, #0
+    STR  R1, [R0]               @ Reset turb_tick
+    
+    @ Avanzar a la siguiente fase de la onda de turbulencia
+    LDR  R0, =turb_phase
+    LDR  R1, [R0]
+    ADD  R1, R1, #1
+    CMP  R1, #8                 @ 8 fases de turbulencia circular
+    MOVGE R1, #0
+    STR  R1, [R0]
+
+TI_END:
     POP  {R0-R2, LR}
     BX   LR
 
@@ -653,9 +731,15 @@ val_yellow: .word C_YELLOW
 .data
 .align 2
 
-@ ---- Variables de la nave / IRQ ----------------------------
+@ ---- Variables Lógicas de Posición -------------------------
+logical_x:     .word 144
+logical_y:     .word 204
+
+@ ---- Variables Visuales de Posición (Lógica + Turbulencia) -
 ship_x:        .word 144
 ship_y:        .word 204
+
+@ ---- Flags del Teclado y Control de Tiempos ----------------
 key_up:        .word 0
 key_down:      .word 0
 key_left:      .word 0
@@ -664,6 +748,13 @@ e0_flag_ps2:   .word 0
 break_flag:    .word 0
 anim_frame:    .word 0
 redraw_flag:   .word 0
+turb_tick:     .word 0
+turb_phase:    .word 0
+
+@ ---- Tabla de Órbita de Turbulencia (8 pasos, valores ±1) --
+@ Produce un leve movimiento oscilante tipo "flote espacial"
+turb_off_x:    .word 0,  1,  1,  0, -1, -1, -1,  0
+turb_off_y:    .word -1, -1,  0,  1,  1,  0, -1, -1
 
 @ ---- Buffer del fondo (32 W * 36 H * 2 bytes = 2304) -------
 .align 2
@@ -808,28 +899,26 @@ thruster_2:
     @ Frame 2: Fuego medio
     .word 0x00007818, 0xFD20; .word 0x00007826, 0xFD20
     .word 0x00007C1A, 0xFFC8; .word 0x00007C24, 0xFFC8
-    .word 0x0000801A, 0xFD20; .word 0x00008024, 0xFD20  @ Y=32 Naranja baja
-    .word 0x0000841A, 0xF800; .word 0x00008424, 0xF800  @ Y=33 Punta roja
+    .word 0x0000801A, 0xFD20; .word 0x00008024, 0xFD20
+    .word 0x0000841A, 0xF800; .word 0x00008424, 0xF800
 thruster_2_end:
 
 thruster_3:
     @ Frame 3: Fuego largo e intenso
-    .word 0x00007818, 0xFFC8; .word 0x00007826, 0xFFC8  @ Base más amarilla
+    .word 0x00007818, 0xFFC8; .word 0x00007826, 0xFFC8
     .word 0x00007C18, 0xFD20; .word 0x00007C1A, 0xFD20
     .word 0x00007C24, 0xFD20; .word 0x00007C26, 0xFD20
-    .word 0x00008018, 0xFFE0; .word 0x0000801A, 0xFFE0  @ Amarillo brillante medio
+    .word 0x00008018, 0xFFE0; .word 0x0000801A, 0xFFE0
     .word 0x00008024, 0xFFE0; .word 0x00008026, 0xFFE0
-    .word 0x0000841A, 0xFD20; .word 0x00008424, 0xFD20  @ Vuelve a naranja
-    .word 0x0000881A, 0xF800; .word 0x00008824, 0xF800  @ Y=34 Punta final roja
+    .word 0x0000841A, 0xFD20; .word 0x00008424, 0xFD20
+    .word 0x0000881A, 0xF800; .word 0x00008824, 0xF800
 thruster_3_end:
 
 @ ============================================================
 @ DATOS DE GALAXIAS LEJANAS (Fondo)
-@ Representación densa con núcleo, espiral y colores reales
 @ ============================================================
 galaxies_data:
     @ --- Galaxia 1: Espiral Púrpura Densa (Arriba Izquierda) ---
-    @ Colores: 0xCE79 (Núcleo rosado), 0x7173 (Púrpura medio), 0x3809 (Borde)
     @ Y=57
     .word (57<<10)+(66<<1), 0x3809; .word (57<<10)+(67<<1), 0x3809; .word (57<<10)+(68<<1), 0x3809
     @ Y=58
