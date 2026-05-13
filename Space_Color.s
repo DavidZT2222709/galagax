@@ -1,190 +1,656 @@
 @ ============================================================
-@ fondo_espacial_v4.s
-@ Fondo espacial con estrellas - VGA Pixel Buffer
+@ space_ship.s
+@ Nave espacial sobre fondo de estrellas — VGA Pixel Buffer
+@ Movimiento con flechas del teclado (PS/2) por interrupciones
 @ ARMv7 - DE1-SoC / CPUlator
 @
-@ CLAVE: CPUlator usa stride = 1024 bytes por fila (y << 10)
-@        aunque la pantalla visible sea 320x240.
-@        Buffer total = 512 * 256 * 2 = 262144 bytes = 131072 hwords
-@        Offset de pixel (x,y) = (y << 10) + (x << 1)
+@ CLAVE: stride de CPUlator = 1024 bytes/fila (y<<10).
+@        Offset de pixel (x,y) = (y<<10) + (x<<1)
+@        Pantalla visible 320x240.
 @ ============================================================
 
 .equ FB_BASE,  0xC8000000
 
-@ Colores RGB565
+@ Colores fondo
 .equ C_BLACK,  0x0000
 .equ C_WHITE,  0xFFFF
 .equ C_BLUE_P, 0x9CF3
 .equ C_YELLOW, 0xFFE0
 .equ C_GRAY,   0x4208
 
+@ Tamaño del sprite (caja envolvente)
+.equ SHIP_W,  32
+.equ SHIP_H,  32
+
+@ ============================================================
+@ TABLA DE VECTORES
+@ ============================================================
+.section .vectors, "ax"
+    B   _start
+    B   SERVICE_UND
+    B   SERVICE_SVC
+    B   SERVICE_ABT_INST
+    B   SERVICE_ABT_DATA
+    .word 0
+    B   SERVICE_IRQ
+    B   SERVICE_FIQ
+
 @ ============================================================
 .text
 .global _start
-
 _start:
+    @ ---- Pilas para modos IRQ y SVC ------------------------
+    MOV  R1, #0b11010010        @ modo IRQ, IRQ/FIQ deshab.
+    MSR  CPSR_c, R1
+    LDR  SP, =0xFFFFEFFC
 
-@ ----------------------------------------------------------
-@ PASO 1: Limpiar TODO el buffer a negro
-@   131072 halfwords (igual que el código de referencia)
-@   stride real = 1024 bytes = 512 píxeles por fila
-@ ----------------------------------------------------------
+    MOV  R0, #0b11010011        @ modo SVC, IRQ/FIQ deshab.
+    MSR  CPSR_c, R0
+    LDR  SP, =0xFFFFFFFC
+
+    @ ---- Pintar fondo (una sola vez) -----------------------
+    BL   DRAW_BACKGROUND
+
+    @ ---- Inicializar posición de la nave ------------------
+    @ Centrada horizontal: x = (320 - 32)/2 = 144
+    @ Pegada abajo:        y = 240 - 32     = 208
+    LDR  R0, =ship_x
+    MOV  R1, #144
+    STR  R1, [R0]
+    LDR  R0, =ship_y
+    MOV  R1, #208
+    STR  R1, [R0]
+
+    @ Estado de teclas en 0
+    MOV  R1, #0
+    LDR  R0, =key_up
+    STR  R1, [R0]
+    LDR  R0, =key_down
+    STR  R1, [R0]
+    LDR  R0, =key_left
+    STR  R1, [R0]
+    LDR  R0, =key_right
+    STR  R1, [R0]
+
+    LDR  R0, =e0_flag_ps2
+    STR  R1, [R0]
+    LDR  R0, =break_flag
+    STR  R1, [R0]
+
+    @ ---- Guardar fondo y pintar nave por primera vez -------
+    BL   SAVE_BG
+    BL   DRAW_SHIP
+
+    @ ---- Configurar interrupciones -------------------------
+    BL   SET_IRQs
+    BL   CONFIG_INTERVAL_TIMER
+    BL   CONFIG_PS2
+
+    @ Habilitar IRQs en CPSR (modo SVC con IRQ habilitado)
+    MOV  R1, #0b01010011
+    MSR  CPSR_c, R1
+
+@ ============================================================
+@ MAIN LOOP
+@ Cada tick:
+@   dx = (key_right - key_left) * STEP
+@   dy = (key_down  - key_up   ) * STEP
+@ Si hay movimiento: restaurar fondo, mover con clamp, guardar
+@ fondo nuevo, repintar nave.
+@ Soporta diagonal: si hay dos teclas (ej. UP + RIGHT) ambas
+@ contribuyen y la nave se mueve en diagonal.
+@ ============================================================
+MAIN_LOOP:
+    @ ---- Calcular dx ---------------------------------------
+    LDR  R0, =key_right
+    LDR  R0, [R0]
+    LDR  R1, =key_left
+    LDR  R1, [R1]
+    SUB  R6, R0, R1             @ R6 = dir_x  (-1, 0, +1)
+    LSL  R6, R6, #2             @ * STEP(4)
+
+    @ ---- Calcular dy ---------------------------------------
+    LDR  R0, =key_down
+    LDR  R0, [R0]
+    LDR  R1, =key_up
+    LDR  R1, [R1]
+    SUB  R7, R0, R1             @ R7 = dir_y  (-1, 0, +1)
+    LSL  R7, R7, #2             @ * STEP(4)
+
+    @ ---- Si ambas son 0 -> esperar y reintentar -----------
+    ORRS R0, R6, R7
+    BEQ  MAIN_WAIT
+
+    @ ---- Hay movimiento: borrar nave ----------------------
+    BL   RESTORE_BG
+
+    @ ---- Aplicar dx con clamping --------------------------
+    LDR  R0, =ship_x
+    LDR  R4, [R0]
+    ADD  R4, R4, R6
+    CMP  R4, #0
+    MOVLT R4, #0
+    LDR  R5, =320-SHIP_W        @ x_max = 288
+    CMP  R4, R5
+    MOVGT R4, R5
+    STR  R4, [R0]
+
+    @ ---- Aplicar dy con clamping --------------------------
+    LDR  R0, =ship_y
+    LDR  R4, [R0]
+    ADD  R4, R4, R7
+    CMP  R4, #0
+    MOVLT R4, #0
+    LDR  R5, =240-SHIP_H        @ y_max = 208
+    CMP  R4, R5
+    MOVGT R4, R5
+    STR  R4, [R0]
+
+    @ ---- Capturar fondo nuevo y dibujar nave --------------
+    BL   SAVE_BG
+    BL   DRAW_SHIP
+
+MAIN_WAIT:
+    BL   DELAY
+    B    MAIN_LOOP
+
+@ ============================================================
+@ DELAY pequeño para no procesar muchas teclas a la vez
+@ ============================================================
+DELAY:
+    PUSH {R0, LR}
+    LDR  R0, =200000
+DELAY_LOOP:
+    SUBS R0, R0, #1
+    BNE  DELAY_LOOP
+    POP  {R0, LR}
+    BX   LR
+
+@ ============================================================
+@ DRAW_SHIP
+@ Pinta el sprite a partir de (ship_x, ship_y) leyendo la tabla
+@ ship_sprite[ (offset_rel, color) ... ] hasta ship_sprite_end
+@ ============================================================
+DRAW_SHIP:
+    PUSH {R4-R10, LR}
+    LDR  R4, =FB_BASE
+    LDR  R5, =ship_x
+    LDR  R5, [R5]               @ R5 = x
+    LDR  R6, =ship_y
+    LDR  R6, [R6]               @ R6 = y
+
+    @ base_offset = (y<<10) + (x<<1)
+    LSL  R7, R6, #10
+    ADD  R7, R7, R5, LSL #1     @ R7 = base_offset
+    ADD  R7, R7, R4             @ R7 = puntero FB al (x,y) del sprite
+
+    LDR  R8, =ship_sprite
+    LDR  R9, =ship_sprite_end
+
+DS_LOOP:
+    CMP  R8, R9
+    BGE  DS_DONE
+    LDR  R10, [R8], #4          @ offset_rel
+    LDR  R0,  [R8], #4          @ color (16 bits útiles)
+    ADD  R10, R10, R7           @ dirección final
+    STRH R0,  [R10]
+    B    DS_LOOP
+DS_DONE:
+    POP  {R4-R10, LR}
+    BX   LR
+
+@ ============================================================
+@ SAVE_BG / RESTORE_BG
+@ Guarda y restaura el bloque 32x32 bajo la nave a un buffer
+@ bg_buffer (32*32 halfwords = 2048 bytes).
+@ ============================================================
+SAVE_BG:
+    PUSH {R4-R10, LR}
+    LDR  R4, =FB_BASE
+    LDR  R5, =ship_x
+    LDR  R5, [R5]
+    LDR  R6, =ship_y
+    LDR  R6, [R6]
+
+    LSL  R7, R6, #10
+    ADD  R7, R7, R5, LSL #1
+    ADD  R7, R7, R4             @ R7 = puntero FB inicio
+
+    LDR  R8, =bg_buffer
+    MOV  R9, #SHIP_H            @ filas restantes
+SB_ROW:
+    CMP  R9, #0
+    BEQ  SB_DONE
+    MOV  R10, #SHIP_W           @ cols restantes
+    MOV  R0, R7                 @ puntero a fila actual
+SB_COL:
+    CMP  R10, #0
+    BEQ  SB_NEXT
+    LDRH R1, [R0], #2
+    STRH R1, [R8], #2
+    SUB  R10, R10, #1
+    B    SB_COL
+SB_NEXT:
+    ADD  R7, R7, #1024          @ siguiente fila de la pantalla
+    SUB  R9, R9, #1
+    B    SB_ROW
+SB_DONE:
+    POP  {R4-R10, LR}
+    BX   LR
+
+RESTORE_BG:
+    PUSH {R4-R10, LR}
+    LDR  R4, =FB_BASE
+    LDR  R5, =ship_x
+    LDR  R5, [R5]
+    LDR  R6, =ship_y
+    LDR  R6, [R6]
+
+    LSL  R7, R6, #10
+    ADD  R7, R7, R5, LSL #1
+    ADD  R7, R7, R4
+
+    LDR  R8, =bg_buffer
+    MOV  R9, #SHIP_H
+RB_ROW:
+    CMP  R9, #0
+    BEQ  RB_DONE
+    MOV  R10, #SHIP_W
+    MOV  R0, R7
+RB_COL:
+    CMP  R10, #0
+    BEQ  RB_NEXT
+    LDRH R1, [R8], #2
+    STRH R1, [R0], #2
+    SUB  R10, R10, #1
+    B    RB_COL
+RB_NEXT:
+    ADD  R7, R7, #1024
+    SUB  R9, R9, #1
+    B    RB_ROW
+RB_DONE:
+    POP  {R4-R10, LR}
+    BX   LR
+
+@ ============================================================
+@ DRAW_BACKGROUND
+@ Pinta fondo negro + estrellas blancas, azul pálido, amarillas,
+@ medianas (cruz 5px) y grandes (cruz 9px). Misma lógica que el
+@ Space_Color original.
+@ ============================================================
+DRAW_BACKGROUND:
+    PUSH {R0-R12, LR}
+
+    @ ---- Limpiar buffer a negro ----------------------------
     LDR  R4, =FB_BASE
     MOV  R5, #0
     LDR  R6, =131072
-
-CLEAR_LOOP:
+DB_CLEAR:
     SUBS R6, R6, #1
-    BMI  CLEAR_DONE
+    BMI  DB_CLEAR_DONE
     STRH R5, [R4], #2
-    B    CLEAR_LOOP
+    B    DB_CLEAR
+DB_CLEAR_DONE:
 
-CLEAR_DONE:
-
-@ ----------------------------------------------------------
-@ PASO 2: Estrellas blancas (1 px)
-@ offset = (y << 10) + (x << 1)
-@ ----------------------------------------------------------
+    @ ---- Estrellas blancas (1 px) --------------------------
     LDR  R6, =FB_BASE
     LDR  R7, =stars_white
     LDR  R8, =stars_white_end
     MOV  R5, #C_WHITE
-
-swhite:
+DB_WHITE:
     CMP  R7, R8
-    BGE  sblue
+    BGE  DB_BLUE
     LDR  R4, [R7], #4
     ADD  R3, R4, R6
     STRH R5, [R3]
-    B    swhite
+    B    DB_WHITE
 
-@ ----------------------------------------------------------
-@ PASO 2b: Estrellas azul pálido
-@ ----------------------------------------------------------
-sblue:
+DB_BLUE:
     LDR  R7, =stars_blue
     LDR  R8, =stars_blue_end
     LDR  R5, val_blue
-
-sblue_loop:
+DB_BLUE_LOOP:
     CMP  R7, R8
-    BGE  syellow
+    BGE  DB_YELLOW
     LDR  R4, [R7], #4
     ADD  R3, R4, R6
     STRH R5, [R3]
-    B    sblue_loop
+    B    DB_BLUE_LOOP
 
-@ ----------------------------------------------------------
-@ PASO 2c: Estrellas amarillas
-@ ----------------------------------------------------------
-syellow:
+DB_YELLOW:
     LDR  R7, =stars_yellow
     LDR  R8, =stars_yellow_end
     LDR  R5, val_yellow
-
-syellow_loop:
+DB_YELLOW_LOOP:
     CMP  R7, R8
-    BGE  smed
+    BGE  DB_MED
     LDR  R4, [R7], #4
     ADD  R3, R4, R6
     STRH R5, [R3]
-    B    syellow_loop
+    B    DB_YELLOW_LOOP
 
-@ ----------------------------------------------------------
-@ PASO 3: Estrellas medianas (cruz 5px)
-@ STRIDE = 1024 bytes cargado en R11
-@ ----------------------------------------------------------
-smed:
+    @ ---- Estrellas medianas (cruz 5px) ---------------------
+DB_MED:
     LDR  R7,  =stars_med
     LDR  R8,  =stars_med_end
-    LDR  R11, val_stride       @ R11 = 1024
-
-smed_loop:
+    LDR  R11, val_stride        @ R11 = 1024
+DB_MED_LOOP:
     CMP  R7, R8
-    BGE  slarge
-
-    LDR  R4, [R7], #4          @ offset centro
-    LDR  R9, [R7], #4          @ color centro
+    BGE  DB_LARGE
+    LDR  R4, [R7], #4
+    LDR  R9, [R7], #4
 
     ADD  R3, R4, R6
-    STRH R9, [R3]              @ centro
+    STRH R9, [R3]               @ centro
 
     MOV  R5, #C_GRAY
-
-    SUB  R3, R4, #2            @ izquierda (x-1)
+    SUB  R3, R4, #2
     ADD  R3, R3, R6
     STRH R5, [R3]
-
-    ADD  R3, R4, #2            @ derecha (x+1)
+    ADD  R3, R4, #2
     ADD  R3, R3, R6
     STRH R5, [R3]
-
-    SUB  R3, R4, R11           @ arriba (y-1): offset - 1024
+    SUB  R3, R4, R11
     ADD  R3, R3, R6
     STRH R5, [R3]
-
-    ADD  R3, R4, R11           @ abajo (y+1): offset + 1024
+    ADD  R3, R4, R11
     ADD  R3, R3, R6
     STRH R5, [R3]
+    B    DB_MED_LOOP
 
-    B    smed_loop
-
-@ ----------------------------------------------------------
-@ PASO 4: Estrellas grandes (cruz 9px)
-@ ----------------------------------------------------------
-slarge:
+    @ ---- Estrellas grandes (cruz 9px) ----------------------
+DB_LARGE:
     LDR  R7,  =stars_large
     LDR  R8,  =stars_large_end
-    LDR  R11, val_stride       @ 1024
-    LSL  R12, R11, #1          @ 2048 = stride*2
+    LDR  R11, val_stride
+    LSL  R12, R11, #1
     MOV  R5,  #C_WHITE
     MOV  R10, #C_GRAY
-
-slarge_loop:
+DB_LARGE_LOOP:
     CMP  R7, R8
-    BGE  done
-
+    BGE  DB_DONE
     LDR  R4, [R7], #4
 
-    @ Centro: blanco
-    ADD  R3, R4, R6            ; STRH R5, [R3]
+    ADD  R3, R4, R6 ; STRH R5, [R3]
+    SUB  R3, R4, #2 ; ADD R3, R3, R6 ; STRH R5, [R3]
+    ADD  R3, R4, #2 ; ADD R3, R3, R6 ; STRH R5, [R3]
+    SUB  R3, R4, R11; ADD R3, R3, R6 ; STRH R5, [R3]
+    ADD  R3, R4, R11; ADD R3, R3, R6 ; STRH R5, [R3]
+    SUB  R3, R4, #4 ; ADD R3, R3, R6 ; STRH R10,[R3]
+    ADD  R3, R4, #4 ; ADD R3, R3, R6 ; STRH R10,[R3]
+    SUB  R3, R4, R12; ADD R3, R3, R6 ; STRH R10,[R3]
+    ADD  R3, R4, R12; ADD R3, R3, R6 ; STRH R10,[R3]
+    B    DB_LARGE_LOOP
 
-    @ Brazos distancia 1: blanco
-    SUB  R3, R4, #2    ; ADD R3, R3, R6 ; STRH R5, [R3]
-    ADD  R3, R4, #2    ; ADD R3, R3, R6 ; STRH R5, [R3]
-    SUB  R3, R4, R11   ; ADD R3, R3, R6 ; STRH R5, [R3]
-    ADD  R3, R4, R11   ; ADD R3, R3, R6 ; STRH R5, [R3]
-
-    @ Brazos distancia 2: gris
-    SUB  R3, R4, #4    ; ADD R3, R3, R6 ; STRH R10, [R3]
-    ADD  R3, R4, #4    ; ADD R3, R3, R6 ; STRH R10, [R3]
-    SUB  R3, R4, R12   ; ADD R3, R3, R6 ; STRH R10, [R3]
-    ADD  R3, R4, R12   ; ADD R3, R3, R6 ; STRH R10, [R3]
-
-    B    slarge_loop
-
-done:
-    B    done
+DB_DONE:
+    POP  {R0-R12, LR}
+    BX   LR
 
 @ ============================================================
-@ Literales de 32 bits
+@ SET_IRQs / CONFIG_GIC / CONFIG_INTERRUPT  (igual que Taller7)
+@ Usamos solo:
+@   72 = Interval timer
+@   79 = PS/2
+@ ============================================================
+SET_IRQs:
+    PUSH {LR}
+    MOV  R0, #72
+    BL   CONFIG_GIC
+    MOV  R0, #79
+    BL   CONFIG_GIC
+    POP  {PC}
+
+CONFIG_INTERVAL_TIMER:
+    PUSH {LR}
+    LDR  R0, =0xFF202000
+    LDR  R1, =0xE0FF
+    STR  R1, [R0, #0x08]
+    LDR  R1, =0x05F5
+    STR  R1, [R0, #0x0C]
+    MOV  R1, #7
+    STR  R1, [R0, #0x04]
+    POP  {PC}
+
+CONFIG_PS2:
+    PUSH {LR}
+    LDR  R0, =0xFF200100
+    MOV  R1, #1
+    STR  R1, [R0, #0x04]
+    POP  {PC}
+
+.global CONFIG_GIC
+CONFIG_GIC:
+    PUSH {LR}
+    MOV  R1, #1
+    BL   CONFIG_INTERRUPT
+    LDR  R0, =0xFFFEC100
+    LDR  R1, =0xFFFF
+    STR  R1, [R0, #0x04]
+    MOV  R1, #1
+    STR  R1, [R0]
+    LDR  R0, =0xFFFED000
+    STR  R1, [R0]
+    POP  {PC}
+
+CONFIG_INTERRUPT:
+    PUSH {R4-R5, LR}
+    LSR  R4, R0, #3
+    BIC  R4, R4, #3
+    LDR  R2, =0xFFFED100
+    ADD  R4, R2, R4
+    AND  R2, R0, #0x1F
+    MOV  R5, #1
+    LSL  R2, R5, R2
+    LDR  R3, [R4]
+    ORR  R3, R3, R2
+    STR  R3, [R4]
+    BIC  R4, R0, #3
+    LDR  R2, =0xFFFED800
+    ADD  R4, R2, R4
+    AND  R2, R0, #0x3
+    ADD  R4, R2, R4
+    STRB R1, [R4]
+    POP  {R4-R5, PC}
+
+@ ============================================================
+@ SERVICE_IRQ
+@ Dispatcher: identifica el ID y llama al ISR adecuado.
+@ ============================================================
+.global SERVICE_IRQ
+SERVICE_IRQ:
+    PUSH {R0-R7, LR}
+    LDR  R4, =0xFFFEC100
+    LDR  R5, [R4, #0x0C]        @ ICCIAR
+
+    CMP  R5, #72
+    BNE  IRQ_CHK_PS2
+    BL   TIMER_ISR
+    B    EXIT_IRQ
+IRQ_CHK_PS2:
+    CMP  R5, #79
+    BNE  IRQ_OTHER
+    BL   PS2_ISR
+    B    EXIT_IRQ
+IRQ_OTHER:
+    @ Otro ID no esperado: ignorar
+EXIT_IRQ:
+    STR  R5, [R4, #0x10]        @ ICCEOIR
+    POP  {R0-R7, LR}
+    SUBS PC, LR, #4
+
+@ ============================================================
+@ TIMER_ISR
+@ De momento solo limpia el flag del timer. Punto de extensión
+@ futuro (animación de propulsores, etc).
+@ ============================================================
+.global TIMER_ISR
+TIMER_ISR:
+    PUSH {R0-R1, LR}
+    LDR  R0, =0xFF202000
+    MOV  R1, #0
+    STR  R1, [R0]               @ TO=0, limpia interrupción
+    POP  {R0-R1, LR}
+    BX   LR
+
+@ ============================================================
+@ PS2_ISR  — Decodifica flechas extendidas E0 xx
+@   Up    = E0 75      Down  = E0 72
+@   Left  = E0 6B      Right = E0 74
+@
+@ Mantiene un FLAG POR TECLA (key_up, key_down, key_left, key_right):
+@   make code  (E0 xx)    -> flag = 1
+@   break code (E0 F0 xx) -> flag = 0
+@ Así el main loop puede leer el estado actual de TODAS las teclas
+@ y combinar dos a la vez (movimiento diagonal).
+@ ============================================================
+.equ STEP, 4
+
+.global PS2_ISR
+PS2_ISR:
+    PUSH {R0-R5, LR}
+    LDR  R0, =0xFF200100
+    LDR  R1, [R0]
+    TST  R1, #0x8000            @ RVALID?
+    BEQ  PS2_END
+
+    AND  R0, R1, #0xFF
+
+    @ ---- ¿estábamos esperando un keycode liberado? ----------
+    LDR  R1, =break_flag
+    LDR  R2, [R1]
+    CMP  R2, #1
+    BNE  PS2_NO_BREAK
+
+    @ Sí: este byte (R0) es el código de la tecla que se soltó.
+    @ Bajamos su flag y limpiamos break_flag y e0_flag_ps2.
+    MOV  R2, #0
+    STR  R2, [R1]               @ break_flag = 0
+    LDR  R1, =e0_flag_ps2
+    STR  R2, [R1]               @ e0_flag_ps2 = 0
+    BL   SET_KEY_FLAG_ZERO      @ baja el flag de R0
+    B    PS2_END
+
+PS2_NO_BREAK:
+    @ ---- ¿byte F0? -> próximo byte será una liberación ------
+    CMP  R0, #0xF0
+    BNE  PS2_NO_F0
+    MOV  R2, #1
+    STR  R2, [R1]               @ break_flag = 1
+    B    PS2_END
+
+PS2_NO_F0:
+    @ ---- ¿byte E0? -> próximo byte será extendido -----------
+    LDR  R1, =e0_flag_ps2
+    LDR  R2, [R1]
+    CMP  R2, #1
+    BEQ  PS2_EXT_MAKE
+
+    CMP  R0, #0xE0
+    BNE  PS2_END                @ teclas no extendidas: ignorar
+    MOV  R2, #1
+    STR  R2, [R1]               @ e0_flag_ps2 = 1
+    B    PS2_END
+
+PS2_EXT_MAKE:
+    @ Es un make code extendido (E0 xx). Sube el flag de la tecla.
+    MOV  R2, #0
+    STR  R2, [R1]               @ e0_flag_ps2 = 0
+    BL   SET_KEY_FLAG_ONE
+    B    PS2_END
+
+PS2_END:
+    POP  {R0-R5, LR}
+    BX   LR
+
+@ ============================================================
+@ Helpers para subir/bajar el flag correspondiente al scancode
+@ R0 = scancode (0x75, 0x72, 0x6B, 0x74). No-flecha: nada.
+@ ============================================================
+SET_KEY_FLAG_ONE:
+    PUSH {R3-R4, LR}
+    MOV  R4, #1
+    B    SKF_DISPATCH
+
+SET_KEY_FLAG_ZERO:
+    PUSH {R3-R4, LR}
+    MOV  R4, #0
+
+SKF_DISPATCH:
+    CMP  R0, #0x75              @ UP
+    BNE  SKF_TRY_DOWN
+    LDR  R3, =key_up
+    STR  R4, [R3]
+    B    SKF_END
+SKF_TRY_DOWN:
+    CMP  R0, #0x72              @ DOWN
+    BNE  SKF_TRY_LEFT
+    LDR  R3, =key_down
+    STR  R4, [R3]
+    B    SKF_END
+SKF_TRY_LEFT:
+    CMP  R0, #0x6B              @ LEFT
+    BNE  SKF_TRY_RIGHT
+    LDR  R3, =key_left
+    STR  R4, [R3]
+    B    SKF_END
+SKF_TRY_RIGHT:
+    CMP  R0, #0x74              @ RIGHT
+    BNE  SKF_END
+    LDR  R3, =key_right
+    STR  R4, [R3]
+SKF_END:
+    POP  {R3-R4, LR}
+    BX   LR
+
+@ ============================================================
+@ MANEJADORES DE EXCEPCIONES NO USADOS
+@ ============================================================
+.global SERVICE_UND
+SERVICE_UND:      B SERVICE_UND
+.global SERVICE_SVC
+SERVICE_SVC:      B SERVICE_SVC
+.global SERVICE_ABT_DATA
+SERVICE_ABT_DATA: B SERVICE_ABT_DATA
+.global SERVICE_ABT_INST
+SERVICE_ABT_INST: B SERVICE_ABT_INST
+.global SERVICE_FIQ
+SERVICE_FIQ:      B SERVICE_FIQ
+
+@ ============================================================
+@ Literales
 @ ============================================================
 val_stride: .word 1024
 val_blue:   .word C_BLUE_P
 val_yellow: .word C_YELLOW
 
 @ ============================================================
-@ TABLAS DE OFFSETS
-@ Formula correcta: offset = (y << 10) + (x << 1)
-@                           = y*1024   + x*2
-@ Pantalla visible: x en [0..319], y en [0..239]
+@ DATA
 @ ============================================================
 .data
 .align 2
 
+@ ---- Variables de la nave / IRQ ----------------------------
+ship_x:        .word 144
+ship_y:        .word 208
+key_up:        .word 0
+key_down:      .word 0
+key_left:      .word 0
+key_right:     .word 0
+e0_flag_ps2:   .word 0
+break_flag:    .word 0
+
+@ ---- Buffer del fondo bajo la nave: 32 * 32 halfwords ------
+.align 2
+bg_buffer:
+    .skip 32*32*2
+
+@ ============================================================
+@ TABLAS DE OFFSETS DE ESTRELLAS  (tomadas del Space_Color)
+@ Formula:  offset = (y << 10) + (x << 1)
+@ ============================================================
+
 @ --- 51 estrellas blancas en toda la pantalla ---------------
 stars_white:
-    @ Franja superior y=3..48
     .word  (3<<10)  + (12 <<1)
     .word  (3<<10)  + (288<<1)
     .word  (7<<10)  + (55 <<1)
@@ -203,7 +669,6 @@ stars_white:
     .word  (38<<10) + (138<<1)
     .word  (43<<10) + (248<<1)
     .word  (48<<10) + (78 <<1)
-    @ Franja media-alta y=55..110
     .word  (55<<10) + (302<<1)
     .word  (60<<10) + (172<<1)
     .word  (65<<10) + (12 <<1)
@@ -215,7 +680,6 @@ stars_white:
     .word  (95<<10) + (268<<1)
     .word  (100<<10)+ (108<<1)
     .word  (108<<10)+ (222<<1)
-    @ Franja media y=115..170
     .word  (115<<10)+ (52 <<1)
     .word  (120<<10)+ (285<<1)
     .word  (125<<10)+ (165<<1)
@@ -226,7 +690,6 @@ stars_white:
     .word  (150<<10)+ (75 <<1)
     .word  (155<<10)+ (192<<1)
     .word  (162<<10)+ (312<<1)
-    @ Franja baja y=175..238
     .word  (170<<10)+ (48 <<1)
     .word  (175<<10)+ (218<<1)
     .word  (180<<10)+ (138<<1)
@@ -281,26 +744,409 @@ stars_yellow_end:
 
 @ --- Estrellas medianas: pares (offset, color) --------------
 stars_med:
-    .word (22 <<10)+(148<<1), 0x0000FFFF   @ blanco  (148,22)
-    .word (50 <<10)+(35 <<1), 0x0000FFE0   @ amarillo( 35,50)
-    .word (78 <<10)+(295<<1), 0x0000FFFF   @ blanco  (295,78)
-    .word (105<<10)+(82 <<1), 0x0000FFE0   @ amarillo( 82,105)
-    .word (132<<10)+(218<<1), 0x0000FFFF   @ blanco  (218,132)
-    .word (158<<10)+(52 <<1), 0x0000FFE0   @ amarillo( 52,158)
-    .word (185<<10)+(272<<1), 0x0000FFFF   @ blanco  (272,185)
-    .word (212<<10)+(138<<1), 0x0000FFE0   @ amarillo(138,212)
-    .word (238<<10)+(305<<1), 0x0000FFFF   @ blanco  (305,238) 
+    .word (22 <<10)+(148<<1), 0x0000FFFF
+    .word (50 <<10)+(35 <<1), 0x0000FFE0
+    .word (78 <<10)+(295<<1), 0x0000FFFF
+    .word (105<<10)+(82 <<1), 0x0000FFE0
+    .word (132<<10)+(218<<1), 0x0000FFFF
+    .word (158<<10)+(52 <<1), 0x0000FFE0
+    .word (185<<10)+(272<<1), 0x0000FFFF
+    .word (212<<10)+(138<<1), 0x0000FFE0
+    .word (238<<10)+(305<<1), 0x0000FFFF
 stars_med_end:
 
 @ --- Estrellas grandes: offset del centro -------------------
 stars_large:
-    .word (15 <<10)+(245<<1)   @ (245, 15)
-    .word (58 <<10)+(98 <<1)   @  (98, 58)
-    .word (105<<10)+(298<<1)   @ (298,105)
-    .word (152<<10)+(48 <<1)   @  (48,152)
-    .word (195<<10)+(198<<1)   @ (198,195)
-    .word (230<<10)+(82 <<1)   @  (82,230)
-    .word (68 <<10)+(175<<1)   @ (175, 68)
+    .word (15 <<10)+(245<<1)
+    .word (58 <<10)+(98 <<1)
+    .word (105<<10)+(298<<1)
+    .word (152<<10)+(48 <<1)
+    .word (195<<10)+(198<<1)
+    .word (230<<10)+(82 <<1)
+    .word (68 <<10)+(175<<1)
 stars_large_end:
+
+
+@ ============================================================
+@ Tabla del sprite (32x32) - nave v4 (simétrica)
+@ ============================================================
+ship_sprite:
+    .word 0x0000081E, 0x18C3
+    .word 0x00000820, 0x18C3
+    .word 0x00000C1C, 0x18C3
+    .word 0x00000C1E, 0x9CD3
+    .word 0x00000C20, 0x9CD3
+    .word 0x00000C22, 0x18C3
+    .word 0x0000101C, 0x18C3
+    .word 0x0000101E, 0x9CD3
+    .word 0x00001020, 0x9CD3
+    .word 0x00001022, 0x18C3
+    .word 0x0000141A, 0x18C3
+    .word 0x0000141C, 0x18C3
+    .word 0x0000141E, 0x9CD3
+    .word 0x00001420, 0x9CD3
+    .word 0x00001422, 0x18C3
+    .word 0x00001424, 0x18C3
+    .word 0x0000181A, 0x18C3
+    .word 0x0000181C, 0x9CD3
+    .word 0x0000181E, 0xDEDB
+    .word 0x00001820, 0xDEDB
+    .word 0x00001822, 0x9CD3
+    .word 0x00001824, 0x18C3
+    .word 0x00001C1A, 0x18C3
+    .word 0x00001C1C, 0x9CD3
+    .word 0x00001C1E, 0x05B6
+    .word 0x00001C20, 0x05B6
+    .word 0x00001C22, 0x9CD3
+    .word 0x00001C24, 0x18C3
+    .word 0x0000201A, 0x18C3
+    .word 0x0000201C, 0x9CD3
+    .word 0x0000201E, 0x07FF
+    .word 0x00002020, 0x07FF
+    .word 0x00002022, 0x9CD3
+    .word 0x00002024, 0x18C3
+    .word 0x00002418, 0x18C3
+    .word 0x0000241A, 0x18C3
+    .word 0x0000241C, 0x9CD3
+    .word 0x0000241E, 0x07FF
+    .word 0x00002420, 0x07FF
+    .word 0x00002422, 0x9CD3
+    .word 0x00002424, 0x18C3
+    .word 0x00002426, 0x18C3
+    .word 0x00002816, 0x18C3
+    .word 0x00002818, 0x18C3
+    .word 0x0000281A, 0x9CD3
+    .word 0x0000281C, 0x9CD3
+    .word 0x0000281E, 0x07FF
+    .word 0x00002820, 0x07FF
+    .word 0x00002822, 0x9CD3
+    .word 0x00002824, 0x9CD3
+    .word 0x00002826, 0x18C3
+    .word 0x00002828, 0x18C3
+    .word 0x00002C16, 0x18C3
+    .word 0x00002C18, 0x9CD3
+    .word 0x00002C1A, 0x9CD3
+    .word 0x00002C1C, 0x9CD3
+    .word 0x00002C1E, 0x07FF
+    .word 0x00002C20, 0x07FF
+    .word 0x00002C22, 0x9CD3
+    .word 0x00002C24, 0x9CD3
+    .word 0x00002C26, 0x9CD3
+    .word 0x00002C28, 0x18C3
+    .word 0x00003014, 0x18C3
+    .word 0x00003016, 0x18C3
+    .word 0x00003018, 0x9CD3
+    .word 0x0000301A, 0x6B6D
+    .word 0x0000301C, 0x9CD3
+    .word 0x0000301E, 0x07FF
+    .word 0x00003020, 0x07FF
+    .word 0x00003022, 0x9CD3
+    .word 0x00003024, 0x6B6D
+    .word 0x00003026, 0x9CD3
+    .word 0x00003028, 0x18C3
+    .word 0x0000302A, 0x18C3
+    .word 0x00003412, 0x18C3
+    .word 0x00003414, 0x18C3
+    .word 0x00003416, 0x9CD3
+    .word 0x00003418, 0x6B6D
+    .word 0x0000341A, 0xDEDB
+    .word 0x0000341C, 0xDEDB
+    .word 0x0000341E, 0x9CD3
+    .word 0x00003420, 0x9CD3
+    .word 0x00003422, 0xDEDB
+    .word 0x00003424, 0xDEDB
+    .word 0x00003426, 0x6B6D
+    .word 0x00003428, 0x9CD3
+    .word 0x0000342A, 0x18C3
+    .word 0x0000342C, 0x18C3
+    .word 0x00003810, 0x18C3
+    .word 0x00003812, 0x9CD3
+    .word 0x00003814, 0x6B6D
+    .word 0x00003816, 0x6B6D
+    .word 0x00003818, 0xDEDB
+    .word 0x0000381A, 0xDEDB
+    .word 0x0000381C, 0xDEDB
+    .word 0x0000381E, 0x6B6D
+    .word 0x00003820, 0x6B6D
+    .word 0x00003822, 0xDEDB
+    .word 0x00003824, 0xDEDB
+    .word 0x00003826, 0xDEDB
+    .word 0x00003828, 0x6B6D
+    .word 0x0000382A, 0x6B6D
+    .word 0x0000382C, 0x9CD3
+    .word 0x0000382E, 0x18C3
+    .word 0x00003C0E, 0x18C3
+    .word 0x00003C10, 0x9CD3
+    .word 0x00003C12, 0x39E7
+    .word 0x00003C14, 0x6B6D
+    .word 0x00003C16, 0x6B6D
+    .word 0x00003C18, 0xDEDB
+    .word 0x00003C1A, 0xDEDB
+    .word 0x00003C1C, 0xDEDB
+    .word 0x00003C1E, 0x6B6D
+    .word 0x00003C20, 0x6B6D
+    .word 0x00003C22, 0xDEDB
+    .word 0x00003C24, 0xDEDB
+    .word 0x00003C26, 0xDEDB
+    .word 0x00003C28, 0x6B6D
+    .word 0x00003C2A, 0x6B6D
+    .word 0x00003C2C, 0x39E7
+    .word 0x00003C2E, 0x9CD3
+    .word 0x00003C30, 0x18C3
+    .word 0x0000400C, 0x18C3
+    .word 0x0000400E, 0x9CD3
+    .word 0x00004010, 0x39E7
+    .word 0x00004012, 0x39E7
+    .word 0x00004014, 0x6B6D
+    .word 0x00004016, 0x6B6D
+    .word 0x00004018, 0x6B6D
+    .word 0x0000401A, 0xDEDB
+    .word 0x0000401C, 0xDEDB
+    .word 0x0000401E, 0x6B6D
+    .word 0x00004020, 0x6B6D
+    .word 0x00004022, 0xDEDB
+    .word 0x00004024, 0xDEDB
+    .word 0x00004026, 0x6B6D
+    .word 0x00004028, 0x6B6D
+    .word 0x0000402A, 0x6B6D
+    .word 0x0000402C, 0x39E7
+    .word 0x0000402E, 0x39E7
+    .word 0x00004030, 0x9CD3
+    .word 0x00004032, 0x18C3
+    .word 0x0000440A, 0x18C3
+    .word 0x0000440C, 0x9CD3
+    .word 0x0000440E, 0x39E7
+    .word 0x00004410, 0x39E7
+    .word 0x00004412, 0x39E7
+    .word 0x00004414, 0x9CD3
+    .word 0x00004416, 0x6B6D
+    .word 0x00004418, 0x6B6D
+    .word 0x0000441A, 0x6B6D
+    .word 0x0000441C, 0x6B6D
+    .word 0x0000441E, 0x6B6D
+    .word 0x00004420, 0x6B6D
+    .word 0x00004422, 0x6B6D
+    .word 0x00004424, 0x6B6D
+    .word 0x00004426, 0x6B6D
+    .word 0x00004428, 0x6B6D
+    .word 0x0000442A, 0x9CD3
+    .word 0x0000442C, 0x39E7
+    .word 0x0000442E, 0x39E7
+    .word 0x00004430, 0x39E7
+    .word 0x00004432, 0x9CD3
+    .word 0x00004434, 0x18C3
+    .word 0x00004808, 0x18C3
+    .word 0x0000480A, 0x18C3
+    .word 0x0000480C, 0x39E7
+    .word 0x0000480E, 0x39E7
+    .word 0x00004810, 0x9CD3
+    .word 0x00004812, 0x9CD3
+    .word 0x00004814, 0x9CD3
+    .word 0x00004816, 0x6B6D
+    .word 0x00004818, 0x6B6D
+    .word 0x0000481A, 0xDEDB
+    .word 0x0000481C, 0xDEDB
+    .word 0x0000481E, 0xDEDB
+    .word 0x00004820, 0xDEDB
+    .word 0x00004822, 0xDEDB
+    .word 0x00004824, 0xDEDB
+    .word 0x00004826, 0x6B6D
+    .word 0x00004828, 0x6B6D
+    .word 0x0000482A, 0x9CD3
+    .word 0x0000482C, 0x9CD3
+    .word 0x0000482E, 0x9CD3
+    .word 0x00004830, 0x39E7
+    .word 0x00004832, 0x39E7
+    .word 0x00004834, 0x18C3
+    .word 0x00004836, 0x18C3
+    .word 0x00004C08, 0x18C3
+    .word 0x00004C0A, 0x39E7
+    .word 0x00004C0C, 0x39E7
+    .word 0x00004C0E, 0x9CD3
+    .word 0x00004C10, 0x9CD3
+    .word 0x00004C12, 0x9CD3
+    .word 0x00004C14, 0x9CD3
+    .word 0x00004C16, 0x6B6D
+    .word 0x00004C18, 0x6B6D
+    .word 0x00004C1A, 0xDEDB
+    .word 0x00004C1C, 0xDEDB
+    .word 0x00004C1E, 0xDEDB
+    .word 0x00004C20, 0xDEDB
+    .word 0x00004C22, 0xDEDB
+    .word 0x00004C24, 0xDEDB
+    .word 0x00004C26, 0x6B6D
+    .word 0x00004C28, 0x6B6D
+    .word 0x00004C2A, 0x9CD3
+    .word 0x00004C2C, 0x9CD3
+    .word 0x00004C2E, 0x9CD3
+    .word 0x00004C30, 0x9CD3
+    .word 0x00004C32, 0x39E7
+    .word 0x00004C34, 0x39E7
+    .word 0x00004C36, 0x18C3
+    .word 0x0000500A, 0x18C3
+    .word 0x0000500C, 0x18C3
+    .word 0x0000500E, 0x39E7
+    .word 0x00005010, 0x39E7
+    .word 0x00005012, 0x39E7
+    .word 0x00005014, 0x39E7
+    .word 0x00005016, 0x6B6D
+    .word 0x00005018, 0x6B6D
+    .word 0x0000501A, 0x6B6D
+    .word 0x0000501C, 0x39E7
+    .word 0x0000501E, 0x39E7
+    .word 0x00005020, 0x39E7
+    .word 0x00005022, 0x39E7
+    .word 0x00005024, 0x6B6D
+    .word 0x00005026, 0x6B6D
+    .word 0x00005028, 0x6B6D
+    .word 0x0000502A, 0x39E7
+    .word 0x0000502C, 0x39E7
+    .word 0x0000502E, 0x39E7
+    .word 0x00005030, 0x39E7
+    .word 0x00005032, 0x18C3
+    .word 0x00005034, 0x18C3
+    .word 0x00005410, 0x18C3
+    .word 0x00005412, 0x18C3
+    .word 0x00005414, 0x39E7
+    .word 0x00005416, 0x6B6D
+    .word 0x00005418, 0x6B6D
+    .word 0x0000541A, 0x6B6D
+    .word 0x0000541C, 0x6B6D
+    .word 0x0000541E, 0x39E7
+    .word 0x00005420, 0x39E7
+    .word 0x00005422, 0x6B6D
+    .word 0x00005424, 0x6B6D
+    .word 0x00005426, 0x6B6D
+    .word 0x00005428, 0x6B6D
+    .word 0x0000542A, 0x39E7
+    .word 0x0000542C, 0x18C3
+    .word 0x0000542E, 0x18C3
+    .word 0x00005814, 0x18C3
+    .word 0x00005816, 0x6B6D
+    .word 0x00005818, 0x6B6D
+    .word 0x0000581A, 0x6B6D
+    .word 0x0000581C, 0x6B6D
+    .word 0x0000581E, 0x39E7
+    .word 0x00005820, 0x39E7
+    .word 0x00005822, 0x6B6D
+    .word 0x00005824, 0x6B6D
+    .word 0x00005826, 0x6B6D
+    .word 0x00005828, 0x6B6D
+    .word 0x0000582A, 0x18C3
+    .word 0x00005C14, 0x18C3
+    .word 0x00005C16, 0x6B6D
+    .word 0x00005C18, 0x6B6D
+    .word 0x00005C1A, 0x9CD3
+    .word 0x00005C1C, 0x9CD3
+    .word 0x00005C1E, 0x39E7
+    .word 0x00005C20, 0x39E7
+    .word 0x00005C22, 0x9CD3
+    .word 0x00005C24, 0x9CD3
+    .word 0x00005C26, 0x6B6D
+    .word 0x00005C28, 0x6B6D
+    .word 0x00005C2A, 0x18C3
+    .word 0x00006010, 0x18C3
+    .word 0x00006012, 0x18C3
+    .word 0x00006014, 0x6B6D
+    .word 0x00006016, 0x6B6D
+    .word 0x00006018, 0x39E7
+    .word 0x0000601A, 0x39E7
+    .word 0x0000601C, 0x39E7
+    .word 0x0000601E, 0x39E7
+    .word 0x00006020, 0x39E7
+    .word 0x00006022, 0x39E7
+    .word 0x00006024, 0x39E7
+    .word 0x00006026, 0x39E7
+    .word 0x00006028, 0x6B6D
+    .word 0x0000602A, 0x6B6D
+    .word 0x0000602C, 0x18C3
+    .word 0x0000602E, 0x18C3
+    .word 0x00006410, 0x18C3
+    .word 0x00006412, 0x6B6D
+    .word 0x00006414, 0x39E7
+    .word 0x00006416, 0x9CD3
+    .word 0x00006418, 0x9CD3
+    .word 0x0000641A, 0x9CD3
+    .word 0x0000641C, 0x39E7
+    .word 0x0000641E, 0x39E7
+    .word 0x00006420, 0x39E7
+    .word 0x00006422, 0x39E7
+    .word 0x00006424, 0x9CD3
+    .word 0x00006426, 0x9CD3
+    .word 0x00006428, 0x9CD3
+    .word 0x0000642A, 0x39E7
+    .word 0x0000642C, 0x6B6D
+    .word 0x0000642E, 0x18C3
+    .word 0x00006810, 0x18C3
+    .word 0x00006812, 0x6B6D
+    .word 0x00006814, 0x39E7
+    .word 0x00006816, 0x9CD3
+    .word 0x00006818, 0xDEDB
+    .word 0x0000681A, 0xDEDB
+    .word 0x0000681C, 0x9CD3
+    .word 0x0000681E, 0x39E7
+    .word 0x00006820, 0x39E7
+    .word 0x00006822, 0x9CD3
+    .word 0x00006824, 0xDEDB
+    .word 0x00006826, 0xDEDB
+    .word 0x00006828, 0x9CD3
+    .word 0x0000682A, 0x39E7
+    .word 0x0000682C, 0x6B6D
+    .word 0x0000682E, 0x18C3
+    .word 0x00006C10, 0x18C3
+    .word 0x00006C12, 0x6B6D
+    .word 0x00006C14, 0x39E7
+    .word 0x00006C16, 0x9CD3
+    .word 0x00006C18, 0xDEDB
+    .word 0x00006C1A, 0xDEDB
+    .word 0x00006C1C, 0x9CD3
+    .word 0x00006C1E, 0x39E7
+    .word 0x00006C20, 0x39E7
+    .word 0x00006C22, 0x9CD3
+    .word 0x00006C24, 0xDEDB
+    .word 0x00006C26, 0xDEDB
+    .word 0x00006C28, 0x9CD3
+    .word 0x00006C2A, 0x39E7
+    .word 0x00006C2C, 0x6B6D
+    .word 0x00006C2E, 0x18C3
+    .word 0x00007010, 0x18C3
+    .word 0x00007012, 0x18C3
+    .word 0x00007014, 0x6B6D
+    .word 0x00007016, 0x6B6D
+    .word 0x00007018, 0x39E7
+    .word 0x0000701A, 0x39E7
+    .word 0x0000701C, 0x6B6D
+    .word 0x0000701E, 0x6B6D
+    .word 0x00007020, 0x6B6D
+    .word 0x00007022, 0x6B6D
+    .word 0x00007024, 0x39E7
+    .word 0x00007026, 0x39E7
+    .word 0x00007028, 0x6B6D
+    .word 0x0000702A, 0x6B6D
+    .word 0x0000702C, 0x18C3
+    .word 0x0000702E, 0x18C3
+    .word 0x00007414, 0x18C3
+    .word 0x00007416, 0x18C3
+    .word 0x00007418, 0x18C3
+    .word 0x0000741A, 0x18C3
+    .word 0x0000741C, 0x18C3
+    .word 0x00007422, 0x18C3
+    .word 0x00007424, 0x18C3
+    .word 0x00007426, 0x18C3
+    .word 0x00007428, 0x18C3
+    .word 0x0000742A, 0x18C3
+    .word 0x00007816, 0x18C3
+    .word 0x00007818, 0xFD20
+    .word 0x0000781A, 0x18C3
+    .word 0x00007824, 0x18C3
+    .word 0x00007826, 0xFD20
+    .word 0x00007828, 0x18C3
+    .word 0x00007C18, 0x18C3
+    .word 0x00007C1A, 0xFFC8
+    .word 0x00007C1C, 0x18C3
+    .word 0x00007C22, 0x18C3
+    .word 0x00007C24, 0xFFC8
+    .word 0x00007C26, 0x18C3
+ship_sprite_end:
 
 .end
