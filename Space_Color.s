@@ -1,12 +1,8 @@
 @ ============================================================
 @ space_ship.s
-@ Nave espacial sobre fondo de estrellas — VGA Pixel Buffer
+@ Nave espacial sobre fondo de estrellas y GALAXIAS DE VERDAD
 @ Movimiento con flechas del teclado (PS/2) por interrupciones
 @ ARMv7 - DE1-SoC / CPUlator
-@
-@ CLAVE: stride de CPUlator = 1024 bytes/fila (y<<10).
-@        Offset de pixel (x,y) = (y<<10) + (x<<1)
-@        Pantalla visible 320x240.
 @ ============================================================
 
 .equ FB_BASE,  0xC8000000
@@ -52,8 +48,6 @@ _start:
     BL   DRAW_BACKGROUND
 
     @ ---- Inicializar posición de la nave ------------------
-    @ Centrada horizontal: x = (320 - 32)/2 = 144
-    @ Pegada abajo:        y = 240 - 32     = 208
     LDR  R0, =ship_x
     MOV  R1, #144
     STR  R1, [R0]
@@ -92,13 +86,6 @@ _start:
 
 @ ============================================================
 @ MAIN LOOP
-@ Cada tick:
-@   dx = (key_right - key_left) * STEP
-@   dy = (key_down  - key_up   ) * STEP
-@ Si hay movimiento: restaurar fondo, mover con clamp, guardar
-@ fondo nuevo, repintar nave.
-@ Soporta diagonal: si hay dos teclas (ej. UP + RIGHT) ambas
-@ contribuyen y la nave se mueve en diagonal.
 @ ============================================================
 MAIN_LOOP:
     @ ---- Calcular dx ---------------------------------------
@@ -155,7 +142,7 @@ MAIN_WAIT:
     B    MAIN_LOOP
 
 @ ============================================================
-@ DELAY pequeño para no procesar muchas teclas a la vez
+@ DELAY
 @ ============================================================
 DELAY:
     PUSH {R0, LR}
@@ -168,8 +155,6 @@ DELAY_LOOP:
 
 @ ============================================================
 @ DRAW_SHIP
-@ Pinta el sprite a partir de (ship_x, ship_y) leyendo la tabla
-@ ship_sprite[ (offset_rel, color) ... ] hasta ship_sprite_end
 @ ============================================================
 DRAW_SHIP:
     PUSH {R4-R10, LR}
@@ -179,7 +164,6 @@ DRAW_SHIP:
     LDR  R6, =ship_y
     LDR  R6, [R6]               @ R6 = y
 
-    @ base_offset = (y<<10) + (x<<1)
     LSL  R7, R6, #10
     ADD  R7, R7, R5, LSL #1     @ R7 = base_offset
     ADD  R7, R7, R4             @ R7 = puntero FB al (x,y) del sprite
@@ -201,8 +185,6 @@ DS_DONE:
 
 @ ============================================================
 @ SAVE_BG / RESTORE_BG
-@ Guarda y restaura el bloque 32x32 bajo la nave a un buffer
-@ bg_buffer (32*32 halfwords = 2048 bytes).
 @ ============================================================
 SAVE_BG:
     PUSH {R4-R10, LR}
@@ -274,9 +256,6 @@ RB_DONE:
 
 @ ============================================================
 @ DRAW_BACKGROUND
-@ Pinta fondo negro + estrellas blancas, azul pálido, amarillas,
-@ medianas (cruz 5px) y grandes (cruz 9px). Misma lógica que el
-@ Space_Color original.
 @ ============================================================
 DRAW_BACKGROUND:
     PUSH {R0-R12, LR}
@@ -292,6 +271,20 @@ DB_CLEAR:
     B    DB_CLEAR
 DB_CLEAR_DONE:
 
+    @ ---- Dibujar Galaxias (Fondo profundo y difuminado) ----
+    LDR  R6, =FB_BASE
+    LDR  R7, =galaxies_data
+    LDR  R8, =galaxies_data_end
+DB_GALAXIES_LOOP:
+    CMP  R7, R8
+    BGE  DB_WHITE_INIT       
+    LDR  R4, [R7], #4        
+    LDR  R5, [R7], #4        
+    ADD  R3, R4, R6
+    STRH R5, [R3]
+    B    DB_GALAXIES_LOOP
+
+DB_WHITE_INIT:
     @ ---- Estrellas blancas (1 px) --------------------------
     LDR  R6, =FB_BASE
     LDR  R7, =stars_white
@@ -387,10 +380,7 @@ DB_DONE:
     BX   LR
 
 @ ============================================================
-@ SET_IRQs / CONFIG_GIC / CONFIG_INTERRUPT  (igual que Taller7)
-@ Usamos solo:
-@   72 = Interval timer
-@   79 = PS/2
+@ SET_IRQs / CONFIG_GIC / CONFIG_INTERRUPT  
 @ ============================================================
 SET_IRQs:
     PUSH {LR}
@@ -454,7 +444,6 @@ CONFIG_INTERRUPT:
 
 @ ============================================================
 @ SERVICE_IRQ
-@ Dispatcher: identifica el ID y llama al ISR adecuado.
 @ ============================================================
 .global SERVICE_IRQ
 SERVICE_IRQ:
@@ -480,8 +469,6 @@ EXIT_IRQ:
 
 @ ============================================================
 @ TIMER_ISR
-@ De momento solo limpia el flag del timer. Punto de extensión
-@ futuro (animación de propulsores, etc).
 @ ============================================================
 .global TIMER_ISR
 TIMER_ISR:
@@ -493,15 +480,7 @@ TIMER_ISR:
     BX   LR
 
 @ ============================================================
-@ PS2_ISR  — Decodifica flechas extendidas E0 xx
-@   Up    = E0 75      Down  = E0 72
-@   Left  = E0 6B      Right = E0 74
-@
-@ Mantiene un FLAG POR TECLA (key_up, key_down, key_left, key_right):
-@   make code  (E0 xx)    -> flag = 1
-@   break code (E0 F0 xx) -> flag = 0
-@ Así el main loop puede leer el estado actual de TODAS las teclas
-@ y combinar dos a la vez (movimiento diagonal).
+@ PS2_ISR 
 @ ============================================================
 .equ STEP, 4
 
@@ -522,7 +501,6 @@ PS2_ISR:
     BNE  PS2_NO_BREAK
 
     @ Sí: este byte (R0) es el código de la tecla que se soltó.
-    @ Bajamos su flag y limpiamos break_flag y e0_flag_ps2.
     MOV  R2, #0
     STR  R2, [R1]               @ break_flag = 0
     LDR  R1, =e0_flag_ps2
@@ -563,8 +541,7 @@ PS2_END:
     BX   LR
 
 @ ============================================================
-@ Helpers para subir/bajar el flag correspondiente al scancode
-@ R0 = scancode (0x75, 0x72, 0x6B, 0x74). No-flecha: nada.
+@ Helpers PS2
 @ ============================================================
 SET_KEY_FLAG_ONE:
     PUSH {R3-R4, LR}
@@ -645,11 +622,8 @@ bg_buffer:
     .skip 32*32*2
 
 @ ============================================================
-@ TABLAS DE OFFSETS DE ESTRELLAS  (tomadas del Space_Color)
-@ Formula:  offset = (y << 10) + (x << 1)
+@ TABLAS DE ESTRELLAS
 @ ============================================================
-
-@ --- 51 estrellas blancas en toda la pantalla ---------------
 stars_white:
     .word  (3<<10)  + (12 <<1)
     .word  (3<<10)  + (288<<1)
@@ -704,7 +678,6 @@ stars_white:
     .word  (234<<10)+ (300<<1)
 stars_white_end:
 
-@ --- Estrellas azul pálido ----------------------------------
 stars_blue:
     .word  (5 <<10) + (168<<1)
     .word  (14<<10) + (308<<1)
@@ -728,7 +701,6 @@ stars_blue:
     .word  (232<<10)+ (38 <<1)
 stars_blue_end:
 
-@ --- Estrellas amarillas ------------------------------------
 stars_yellow:
     .word  (10<<10) + (42 <<1)
     .word  (32<<10) + (268<<1)
@@ -742,7 +714,6 @@ stars_yellow:
     .word  (220<<10)+ (78 <<1)
 stars_yellow_end:
 
-@ --- Estrellas medianas: pares (offset, color) --------------
 stars_med:
     .word (22 <<10)+(148<<1), 0x0000FFFF
     .word (50 <<10)+(35 <<1), 0x0000FFE0
@@ -755,7 +726,6 @@ stars_med:
     .word (238<<10)+(305<<1), 0x0000FFFF
 stars_med_end:
 
-@ --- Estrellas grandes: offset del centro -------------------
 stars_large:
     .word (15 <<10)+(245<<1)
     .word (58 <<10)+(98 <<1)
@@ -766,9 +736,8 @@ stars_large:
     .word (68 <<10)+(175<<1)
 stars_large_end:
 
-
 @ ============================================================
-@ Tabla del sprite (32x32) - nave v4 (simétrica)
+@ TABLA SPRITE
 @ ============================================================
 ship_sprite:
     .word 0x0000081E, 0x18C3
@@ -1148,5 +1117,71 @@ ship_sprite:
     .word 0x00007C24, 0xFFC8
     .word 0x00007C26, 0x18C3
 ship_sprite_end:
+
+@ ============================================================
+@ DATOS DE GALAXIAS LEJANAS (Fondo)
+@ Representación densa con núcleo, espiral y colores reales
+@ ============================================================
+galaxies_data:
+    @ --- Galaxia 1: Espiral Púrpura Densa (Arriba Izquierda) ---
+    @ Colores: 0xCE79 (Núcleo rosado brillante), 0x7173 (Púrpura medio), 0x3809 (Borde púrpura oscuro)
+    @ Y=57
+    .word (57<<10)+(66<<1), 0x3809; .word (57<<10)+(67<<1), 0x3809; .word (57<<10)+(68<<1), 0x3809
+    @ Y=58
+    .word (58<<10)+(64<<1), 0x3809; .word (58<<10)+(65<<1), 0x3809
+    .word (58<<10)+(66<<1), 0x7173; .word (58<<10)+(67<<1), 0x7173; .word (58<<10)+(68<<1), 0x7173; .word (58<<10)+(69<<1), 0x7173
+    .word (58<<10)+(70<<1), 0x3809; .word (58<<10)+(71<<1), 0x3809
+    @ Y=59
+    .word (59<<10)+(62<<1), 0x3809; .word (59<<10)+(63<<1), 0x3809
+    .word (59<<10)+(64<<1), 0x7173; .word (59<<10)+(65<<1), 0x7173; .word (59<<10)+(66<<1), 0x7173
+    .word (59<<10)+(67<<1), 0xCE79; .word (59<<10)+(68<<1), 0xCE79; .word (59<<10)+(69<<1), 0xCE79; .word (59<<10)+(70<<1), 0xCE79
+    .word (59<<10)+(71<<1), 0x7173; .word (59<<10)+(72<<1), 0x7173; .word (59<<10)+(73<<1), 0x7173
+    .word (59<<10)+(74<<1), 0x3809
+    @ Y=60
+    .word (60<<10)+(60<<1), 0x3809; .word (60<<10)+(61<<1), 0x3809
+    .word (60<<10)+(62<<1), 0x7173; .word (60<<10)+(63<<1), 0x7173; .word (60<<10)+(64<<1), 0x7173
+    .word (60<<10)+(65<<1), 0xCE79; .word (60<<10)+(66<<1), 0xCE79; .word (60<<10)+(67<<1), 0xCE79; .word (60<<10)+(68<<1), 0xCE79
+    .word (60<<10)+(69<<1), 0xCE79; .word (60<<10)+(70<<1), 0xCE79; .word (60<<10)+(71<<1), 0xCE79; .word (60<<10)+(72<<1), 0xCE79
+    .word (60<<10)+(73<<1), 0x7173; .word (60<<10)+(74<<1), 0x7173; .word (60<<10)+(75<<1), 0x7173
+    .word (60<<10)+(76<<1), 0x3809; .word (60<<10)+(77<<1), 0x3809
+    @ Y=61
+    .word (61<<10)+(63<<1), 0x3809
+    .word (61<<10)+(64<<1), 0x7173; .word (61<<10)+(65<<1), 0x7173; .word (61<<10)+(66<<1), 0x7173
+    .word (61<<10)+(67<<1), 0xCE79; .word (61<<10)+(68<<1), 0xCE79; .word (61<<10)+(69<<1), 0xCE79; .word (61<<10)+(70<<1), 0xCE79; .word (61<<10)+(71<<1), 0xCE79
+    .word (61<<10)+(72<<1), 0x7173; .word (61<<10)+(73<<1), 0x7173; .word (61<<10)+(74<<1), 0x7173; .word (61<<10)+(75<<1), 0x7173
+    .word (61<<10)+(76<<1), 0x3809; .word (61<<10)+(77<<1), 0x3809; .word (61<<10)+(78<<1), 0x3809
+    @ Y=62
+    .word (62<<10)+(66<<1), 0x3809; .word (62<<10)+(67<<1), 0x3809
+    .word (62<<10)+(68<<1), 0x7173; .word (62<<10)+(69<<1), 0x7173; .word (62<<10)+(70<<1), 0x7173; .word (62<<10)+(71<<1), 0x7173
+    .word (62<<10)+(72<<1), 0x3809; .word (62<<10)+(73<<1), 0x3809; .word (62<<10)+(74<<1), 0x3809; .word (62<<10)+(75<<1), 0x3809
+    @ Y=63
+    .word (63<<10)+(70<<1), 0x3809; .word (63<<10)+(71<<1), 0x3809; .word (63<<10)+(72<<1), 0x3809; .word (63<<10)+(73<<1), 0x3809
+
+    @ --- Galaxia 2: Cúmulo Cyan (Centro Derecha) ---
+    @ Colores: 0x07FF (Cyan brillante), 0x03F0 (Azul medio), 0x0188 (Azul oscuro)
+    @ Y=178
+    .word (178<<10)+(238<<1), 0x0188; .word (178<<10)+(239<<1), 0x0188; .word (178<<10)+(240<<1), 0x0188
+    @ Y=179
+    .word (179<<10)+(236<<1), 0x0188; .word (179<<10)+(237<<1), 0x0188
+    .word (179<<10)+(238<<1), 0x03F0; .word (179<<10)+(239<<1), 0x03F0
+    .word (179<<10)+(240<<1), 0x0188; .word (179<<10)+(241<<1), 0x0188
+    @ Y=180
+    .word (180<<10)+(234<<1), 0x0188; .word (180<<10)+(235<<1), 0x0188
+    .word (180<<10)+(236<<1), 0x03F0; .word (180<<10)+(237<<1), 0x03F0
+    .word (180<<10)+(238<<1), 0x07FF; .word (180<<10)+(239<<1), 0x07FF; .word (180<<10)+(240<<1), 0x07FF
+    .word (180<<10)+(241<<1), 0x03F0; .word (180<<10)+(242<<1), 0x03F0
+    .word (180<<10)+(243<<1), 0x0188; .word (180<<10)+(244<<1), 0x0188
+    @ Y=181
+    .word (181<<10)+(236<<1), 0x0188; .word (181<<10)+(237<<1), 0x0188
+    .word (181<<10)+(238<<1), 0x03F0; .word (181<<10)+(239<<1), 0x03F0
+    .word (181<<10)+(240<<1), 0x07FF; .word (181<<10)+(241<<1), 0x07FF; .word (181<<10)+(242<<1), 0x07FF
+    .word (181<<10)+(243<<1), 0x03F0; .word (181<<10)+(244<<1), 0x03F0
+    .word (181<<10)+(245<<1), 0x0188; .word (181<<10)+(246<<1), 0x0188
+    @ Y=182
+    .word (182<<10)+(239<<1), 0x0188; .word (182<<10)+(240<<1), 0x0188
+    .word (182<<10)+(241<<1), 0x03F0; .word (182<<10)+(242<<1), 0x03F0
+    .word (182<<10)+(243<<1), 0x0188; .word (182<<10)+(244<<1), 0x0188
+
+galaxies_data_end:
 
 .end
