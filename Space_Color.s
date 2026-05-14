@@ -48,6 +48,10 @@ _start:
     @ ---- Pintar fondo (una sola vez) -----------------------
     BL   DRAW_BACKGROUND
 
+    @ ---- Pantalla de inicio: esperar ESPACIO ---------------
+    BL   DRAW_SPLASH
+    BL   WAIT_FOR_SPACE         @ bloquea hasta que se presione espacio
+
     @ ---- Inicializar posición (lógica y visual) -----------
     LDR  R0, =logical_x
     MOV  R1, #144
@@ -85,6 +89,8 @@ _start:
     LDR  R0, =turb_tick
     STR  R1, [R0]
     LDR  R0, =turb_phase
+    STR  R1, [R0]
+    LDR  R0, =warp_flag
     STR  R1, [R0]
 
     @ ---- Guardar fondo y pintar nave por primera vez -------
@@ -188,37 +194,70 @@ MAIN_LOOP:
     CMP  R1, #1
     BEQ  DO_REDRAW_STATIC
 
-    B    MAIN_WAIT
+    B    DO_WARP_SCROLL
 
 DO_REDRAW_MOVE:
-    @ Restaurar fondo viejo (usa las variables ship_x/y actuales)
+    @ 1. Borrar nave en posición vieja
     BL   RESTORE_BG
 
-    @ Actualizar la posición visual a la nueva calculada
+    @ 2. Si hay warp pendiente, aprovechar que la nave ya está borrada
+    LDR  R0, =warp_flag
+    LDR  R1, [R0]
+    CMP  R1, #1
+    BNE  DRM_NO_WARP
+    MOV  R1, #0
+    STR  R1, [R0]
+    BL   UPDATE_WARP        @ mover rayos mientras nave está borrada
+DRM_NO_WARP:
+    @ 3. Actualizar posición visual
     LDR  R0, =ship_x
     STR  R8, [R0]
     LDR  R0, =ship_y
     STR  R9, [R0]
 
-    @ Guardar el nuevo bloque de fondo
+    @ 4. Guardar fondo (con rayos, sin nave)
     BL   SAVE_BG
 
-    @ Limpiar flag de animación, ya que vamos a dibujar
+    @ 5. Limpiar flag animación y dibujar nave
     LDR  R0, =redraw_flag
     MOV  R1, #0
     STR  R1, [R0]
-
-    @ Dibujar nave
     BL   DRAW_SHIP
     B    MAIN_WAIT
 
 DO_REDRAW_STATIC:
-    @ Repintar en la misma posición para cambiar frame del propulsor
+    @ 1. Borrar nave
     MOV  R1, #0
     STR  R1, [R0]               @ Limpiar flag de redibujo
-    BL   RESTORE_BG             @ Borrar nave
-    BL   DRAW_SHIP              @ Dibujar nave con nuevo frame
+    BL   RESTORE_BG
+
+    @ 2. Si hay warp pendiente, aprovechamos
+    LDR  R0, =warp_flag
+    LDR  R1, [R0]
+    CMP  R1, #1
+    BNE  DRS_NO_WARP
+    MOV  R1, #0
+    STR  R1, [R0]
+    BL   UPDATE_WARP
+DRS_NO_WARP:
+    @ 3. Guardar fondo y redibujar nave
+    BL   SAVE_BG
+    BL   DRAW_SHIP
     B    MAIN_WAIT
+
+DO_WARP_SCROLL:
+    @ Solo warp (sin movimiento de nave ni animación)
+    LDR  R0, =warp_flag
+    LDR  R1, [R0]
+    CMP  R1, #1
+    BNE  MAIN_WAIT
+    MOV  R1, #0
+    STR  R1, [R0]
+    @ Borrar nave → rayos → guardar fondo → redibujar nave
+    BL   RESTORE_BG
+    BL   UPDATE_WARP
+    BL   SAVE_BG
+    BL   DRAW_SHIP
 
 MAIN_WAIT:
     BL   DELAY
@@ -585,30 +624,299 @@ TIMER_ISR:
     MOV  R1, #1
     STR  R1, [R0]
 
-    @ 3) Temporizador de turbulencia (cambia cada 5 ticks = 4Hz)
+    @ 3) Temporizador de turbulencia (cambia cada 3 ticks)
     LDR  R0, =turb_tick
     LDR  R1, [R0]
     ADD  R1, R1, #1
     CMP  R1, #3
     BGE  TI_DO_TURB
-    STR  R1, [R0]               @ Guardar incremento y salir
+    STR  R1, [R0]
     B    TI_END
 
 TI_DO_TURB:
     MOV  R1, #0
     STR  R1, [R0]               @ Reset turb_tick
-    
-    @ Avanzar a la siguiente fase de la onda de turbulencia
+
     LDR  R0, =turb_phase
     LDR  R1, [R0]
     ADD  R1, R1, #1
-    CMP  R1, #8                 @ 8 fases de turbulencia circular
+    CMP  R1, #8
     MOVGE R1, #0
     STR  R1, [R0]
 
 TI_END:
+    @ 4) Pedir al main loop que actualice el warp
+    LDR  R0, =warp_flag
+    MOV  R1, #1
+    STR  R1, [R0]
+
     POP  {R0-R2, LR}
     BX   LR
+
+
+@ ============================================================
+@ UPDATE_WARP  -  Efecto Velocidad de la Luz
+@ ============================================================
+@ 24 rayos de warp se mueven desde el centro hacia los bordes.
+@ Cada rayo: struct de 5 words en warp_streaks:
+@   [0] x       posición actual X  (0..319)
+@   [1] y       posición actual Y  (0..239)
+@   [2] dx      velocidad X (puede ser negativa)
+@   [3] dy      velocidad Y (puede ser negativa)
+@   [4] age     cuántos pasos lleva (para calcular longitud de cola)
+@
+@ Algoritmo por rayo:
+@   1. Borrar extremo de cola (pintar negro)
+@   2. x += dx, y += dy
+@   3. Si fuera de pantalla -> resetear al centro
+@   4. Pintar cabeza (blanco) y dos píxeles de cola (gris)
+@
+@ Registros usados:
+@   R4 = puntero al rayo actual en la tabla
+@   R5 = FB_BASE
+@   R6 = x
+@   R7 = y
+@   R8 = dx
+@   R9 = dy
+@   R10 = age / temp
+@   R11 = límite tabla (warp_streaks_end)
+@   R12 = temp
+@ ============================================================
+
+@ Constantes auxiliares
+.equ W_STRIDE,  1024    @ bytes por fila
+.equ W_WIDTH,   320
+.equ W_HEIGHT,  240
+.equ W_CX,      160     @ centro X
+.equ W_CY,      120     @ centro Y
+.equ C_WGRAY,   0x632C  @ gris azulado para cola
+
+UPDATE_WARP:
+    PUSH {R4-R12, LR}
+
+    LDR  R5, =FB_BASE
+    LDR  R4, =warp_streaks
+    LDR  R11, =warp_streaks_end
+
+UW_LOOP:
+    CMP  R4, R11
+    BGE  UW_DONE
+
+    @ Cargar rayo actual
+    LDR  R6,  [R4, #0]     @ x
+    LDR  R7,  [R4, #4]     @ y
+    LDR  R8,  [R4, #8]     @ dx
+    LDR  R9,  [R4, #12]    @ dy
+    LDR  R10, [R4, #16]    @ age
+
+    @ --- 1. Borrar cola (pintar negro en x-dx*tail, y-dy*tail) ---
+    @ tail_len = min(age, 6)
+    MOV  R12, R10
+    CMP  R12, #6
+    MOVGT R12, #6          @ R12 = tail_len
+
+    @ tail_x = x - dx*tail_len,  tail_y = y - dy*tail_len
+    MUL  R0, R8, R12       @ R0 = dx * tail_len
+    SUB  R0, R6, R0        @ R0 = tail_x
+    MUL  R1, R9, R12       @ R1 = dy * tail_len
+    SUB  R1, R7, R1        @ R1 = tail_y
+
+    @ Solo borrar si tail está en pantalla
+    CMP  R0, #0
+    BLT  UW_NO_ERASE
+    MOVW R12, #319
+    CMP  R0, R12
+    BGT  UW_NO_ERASE
+    CMP  R1, #0
+    BLT  UW_NO_ERASE
+    MOVW R12, #239
+    CMP  R1, R12
+    BGT  UW_NO_ERASE
+    @ Pintar negro: addr = FB_BASE + tail_y*1024 + tail_x*2
+    LSL  R2, R1, #10       @ tail_y * 1024
+    ADD  R2, R2, R0, LSL #1 @ + tail_x * 2
+    ADD  R2, R2, R5
+    MOV  R3, #0
+    STRH R3, [R2]
+UW_NO_ERASE:
+
+    @ --- 2. Avanzar posición ---
+    ADD  R6, R6, R8        @ x += dx
+    ADD  R7, R7, R9        @ y += dy
+    ADD  R10, R10, #1      @ age++
+
+    @ --- 3. Verificar límites; si fuera, resetear al centro ---
+    CMP  R6, #2
+    BLT  UW_RESET
+    MOVW R12, #317
+    CMP  R6, R12
+    BGT  UW_RESET
+    CMP  R7, #2
+    BLT  UW_RESET
+    MOVW R12, #237
+    CMP  R7, R12
+    BGT  UW_RESET
+    B    UW_DRAW
+
+UW_RESET:
+    @ Resetear: volver al centro con una pequeña variación
+    @ Usamos age como semilla de pseudo-aleatoriedad
+    LDR  R6, =W_CX
+    LDR  R7, =W_CY
+    @ Offset pequeño: (age*3) mod 20 - 10  en cada eje
+    MOV  R0, R10
+    MOV  R2, #7
+    MUL  R3, R0, R2
+    MOV  R2, #21
+    @ R3 mod 21 - 10 -> simple: AND con 15, resta 8
+    AND  R3, R3, #15
+    SUB  R3, R3, #8
+    ADD  R6, R6, R3
+    MOV  R0, R10
+    MOV  R2, #11
+    MUL  R3, R0, R2
+    AND  R3, R3, #15
+    SUB  R3, R3, #8
+    ADD  R7, R7, R3
+    MOV  R10, #0           @ reset age
+
+UW_DRAW:
+    @ --- 4a. Pintar cola media (gris, 1 paso atrás) ---
+    SUB  R0, R6, R8        @ x - dx
+    SUB  R1, R7, R9        @ y - dy
+    CMP  R0, #0
+    BLT  UW_DRAW_HEAD
+    MOVW R12, #319
+    CMP  R0, R12
+    BGT  UW_DRAW_HEAD
+    CMP  R1, #0
+    BLT  UW_DRAW_HEAD
+    MOVW R12, #239
+    CMP  R1, R12
+    BGT  UW_DRAW_HEAD
+    LSL  R2, R1, #10
+    ADD  R2, R2, R0, LSL #1
+    ADD  R2, R2, R5
+    LDR  R3, =C_WGRAY
+    STRH R3, [R2]
+
+    @ --- 4b. Pintar cola lejana (gris oscuro, 2 pasos atrás) ---
+    SUB  R0, R6, R8, LSL #1  @ x - dx*2
+    SUB  R1, R7, R9, LSL #1  @ y - dy*2
+    CMP  R0, #0
+    BLT  UW_DRAW_HEAD
+    MOVW R12, #319
+    CMP  R0, R12
+    BGT  UW_DRAW_HEAD
+    CMP  R1, #0
+    BLT  UW_DRAW_HEAD
+    MOVW R12, #239
+    CMP  R1, R12
+    BGT  UW_DRAW_HEAD
+    LSL  R2, R1, #10
+    ADD  R2, R2, R0, LSL #1
+    ADD  R2, R2, R5
+    MOV  R3, #C_GRAY
+    STRH R3, [R2]
+
+UW_DRAW_HEAD:
+    @ --- 4c. Pintar cabeza (blanco brillante) ---
+    CMP  R6, #0
+    BLT  UW_SAVE
+    MOVW R12, #319
+    CMP  R6, R12
+    BGT  UW_SAVE
+    CMP  R7, #0
+    BLT  UW_SAVE
+    MOVW R12, #239
+    CMP  R7, R12
+    BGT  UW_SAVE
+    LSL  R2, R7, #10
+    ADD  R2, R2, R6, LSL #1
+    ADD  R2, R2, R5
+    MOV  R3, #C_WHITE
+    STRH R3, [R2]
+
+UW_SAVE:
+    @ Guardar estado actualizado
+    STR  R6,  [R4, #0]
+    STR  R7,  [R4, #4]
+    STR  R10, [R4, #16]    @ age (dx, dy no cambian)
+
+    ADD  R4, R4, #20       @ siguiente rayo (5 words * 4 bytes)
+    B    UW_LOOP
+
+UW_DONE:
+    POP  {R4-R12, LR}
+    BX   LR
+
+
+@ ============================================================
+@ DRAW_SPLASH  -  Dibuja la pantalla de inicio sobre el fondo
+@ ============================================================
+DRAW_SPLASH:
+    PUSH {R0-R4, LR}
+    LDR  R4, =FB_BASE
+    LDR  R0, =splash_text
+    LDR  R1, =splash_text_end
+DS_SPLASH_LOOP:
+    CMP  R0, R1
+    BGE  DS_SPLASH_DONE
+    LDR  R2, [R0], #4           @ offset en FB
+    LDR  R3, [R0], #4           @ color
+    ADD  R2, R2, R4
+    STRH R3, [R2]
+    B    DS_SPLASH_LOOP
+DS_SPLASH_DONE:
+    POP  {R0-R4, LR}
+    BX   LR
+
+
+@ ============================================================
+@ WAIT_FOR_SPACE  -  Espera a que se presione la barra espaciadora
+@ PS/2 scancode del espacio: 0x29
+@ Lee el puerto PS/2 directamente (polling, sin IRQ)
+@ ============================================================
+WAIT_FOR_SPACE:
+    PUSH {R0-R3, LR}
+    LDR  R0, =0xFF200100        @ PS/2 base address
+WFS_LOOP:
+    LDR  R1, [R0]               @ leer PS/2 data register
+    TST  R1, #0x8000            @ bit15 = RVALID
+    BEQ  WFS_LOOP               @ si no hay dato, seguir esperando
+    AND  R2, R1, #0xFF          @ byte recibido
+    CMP  R2, #0xF0              @ ¿es break code?
+    BEQ  WFS_LOOP               @ ignorar break codes
+    CMP  R2, #0xE0              @ ¿es extended?
+    BEQ  WFS_LOOP               @ ignorar E0
+    CMP  R2, #0x29              @ ¿es espacio?
+    BNE  WFS_LOOP               @ no -> seguir esperando
+    @ Espacio presionado! Limpiar el texto de splash
+    BL   CLEAR_SPLASH
+    POP  {R0-R3, LR}
+    BX   LR
+
+@ ============================================================
+@ CLEAR_SPLASH  -  Borra el texto de la pantalla de inicio
+@ ============================================================
+CLEAR_SPLASH:
+    PUSH {R0-R4, LR}
+    LDR  R4, =FB_BASE
+    LDR  R0, =splash_text
+    LDR  R1, =splash_text_end
+CS_LOOP:
+    CMP  R0, R1
+    BGE  CS_DONE
+    LDR  R2, [R0], #4           @ offset en FB
+    ADD  R0, R0, #4             @ saltar color
+    ADD  R2, R2, R4
+    MOV  R3, #0                 @ negro
+    STRH R3, [R2]
+    B    CS_LOOP
+CS_DONE:
+    POP  {R0-R4, LR}
+    BX   LR
+
 
 @ ============================================================
 @ PS2_ISR 
@@ -750,6 +1058,589 @@ anim_frame:    .word 0
 redraw_flag:   .word 0
 turb_tick:     .word 0
 turb_phase:    .word 0
+warp_flag:     .word 0          @ 1 = actualizar warp este tick
+
+@ ============================================================
+@ TABLA DE RAYOS WARP  (24 rayos × 5 words)
+@ Formato por entrada: x, y, dx, dy, age
+@ ============================================================
+.align 2
+warp_streaks:
+    .word 175, 120, 9, 0, 3
+    .word 220, 132, 6, 1, 7
+    .word 201, 146, 5, 3, 6
+    .word 171, 131, 5, 4, 3
+    .word 188, 164, 3, 5, 6
+    .word 177, 173, 4, 13, 5
+    .word 162, 171, 0, 9, 8
+    .word 139, 179, -2, 7, 7
+    .word 144, 147, -3, 6, 3
+    .word 132, 143, -5, 4, 2
+    .word 128, 139, -9, 5, 6
+    .word 143, 125, -12, 3, 6
+    .word 121, 122, -6, 0, 6
+    .word 106, 107, -10, -2, 6
+    .word 142, 111, -5, -2, 7
+    .word 135, 97, -5, -4, 8
+    .word 148, 102, -6, -10, 4
+    .word 141, 54, -2, -10, 3
+    .word 159, 92, 0, -9, 7
+    .word 179, 67, 2, -6, 6
+    .word 185, 78, 4, -7, 3
+    .word 182, 97, 9, -9, 3
+    .word 220, 88, 5, -2, 3
+    .word 224, 107, 10, -2, 5
+warp_streaks_end:
+
+@ ============================================================
+@ TEXTO PANTALLA DE INICIO (píxeles precalculados)
+@ ============================================================
+.align 2
+splash_text:
+    .word 0x00016100, 0x07FF
+    .word 0x00016102, 0x07FF
+    .word 0x00016104, 0x07FF
+    .word 0x00016106, 0x07FF
+    .word 0x00016500, 0x07FF
+    .word 0x00016508, 0x07FF
+    .word 0x00016900, 0x07FF
+    .word 0x00016908, 0x07FF
+    .word 0x00016D00, 0x07FF
+    .word 0x00016D02, 0x07FF
+    .word 0x00016D04, 0x07FF
+    .word 0x00016D06, 0x07FF
+    .word 0x00017100, 0x07FF
+    .word 0x00017500, 0x07FF
+    .word 0x00017900, 0x07FF
+    .word 0x0001610C, 0x07FF
+    .word 0x0001610E, 0x07FF
+    .word 0x00016110, 0x07FF
+    .word 0x00016112, 0x07FF
+    .word 0x0001650C, 0x07FF
+    .word 0x00016514, 0x07FF
+    .word 0x0001690C, 0x07FF
+    .word 0x00016914, 0x07FF
+    .word 0x00016D0C, 0x07FF
+    .word 0x00016D0E, 0x07FF
+    .word 0x00016D10, 0x07FF
+    .word 0x00016D12, 0x07FF
+    .word 0x0001710C, 0x07FF
+    .word 0x00017110, 0x07FF
+    .word 0x0001750C, 0x07FF
+    .word 0x00017512, 0x07FF
+    .word 0x0001790C, 0x07FF
+    .word 0x00017914, 0x07FF
+    .word 0x00016118, 0x07FF
+    .word 0x0001611A, 0x07FF
+    .word 0x0001611C, 0x07FF
+    .word 0x0001611E, 0x07FF
+    .word 0x00016120, 0x07FF
+    .word 0x00016518, 0x07FF
+    .word 0x00016918, 0x07FF
+    .word 0x00016D18, 0x07FF
+    .word 0x00016D1A, 0x07FF
+    .word 0x00016D1C, 0x07FF
+    .word 0x00016D1E, 0x07FF
+    .word 0x00017118, 0x07FF
+    .word 0x00017518, 0x07FF
+    .word 0x00017918, 0x07FF
+    .word 0x0001791A, 0x07FF
+    .word 0x0001791C, 0x07FF
+    .word 0x0001791E, 0x07FF
+    .word 0x00017920, 0x07FF
+    .word 0x00016126, 0x07FF
+    .word 0x00016128, 0x07FF
+    .word 0x0001612A, 0x07FF
+    .word 0x0001612C, 0x07FF
+    .word 0x00016524, 0x07FF
+    .word 0x00016924, 0x07FF
+    .word 0x00016D26, 0x07FF
+    .word 0x00016D28, 0x07FF
+    .word 0x00016D2A, 0x07FF
+    .word 0x0001712C, 0x07FF
+    .word 0x0001752C, 0x07FF
+    .word 0x00017924, 0x07FF
+    .word 0x00017926, 0x07FF
+    .word 0x00017928, 0x07FF
+    .word 0x0001792A, 0x07FF
+    .word 0x00016132, 0x07FF
+    .word 0x00016134, 0x07FF
+    .word 0x00016136, 0x07FF
+    .word 0x00016138, 0x07FF
+    .word 0x00016530, 0x07FF
+    .word 0x00016930, 0x07FF
+    .word 0x00016D32, 0x07FF
+    .word 0x00016D34, 0x07FF
+    .word 0x00016D36, 0x07FF
+    .word 0x00017138, 0x07FF
+    .word 0x00017538, 0x07FF
+    .word 0x00017930, 0x07FF
+    .word 0x00017932, 0x07FF
+    .word 0x00017934, 0x07FF
+    .word 0x00017936, 0x07FF
+    .word 0x0001614A, 0x07FF
+    .word 0x0001614C, 0x07FF
+    .word 0x0001614E, 0x07FF
+    .word 0x00016150, 0x07FF
+    .word 0x00016548, 0x07FF
+    .word 0x00016948, 0x07FF
+    .word 0x00016D4A, 0x07FF
+    .word 0x00016D4C, 0x07FF
+    .word 0x00016D4E, 0x07FF
+    .word 0x00017150, 0x07FF
+    .word 0x00017550, 0x07FF
+    .word 0x00017948, 0x07FF
+    .word 0x0001794A, 0x07FF
+    .word 0x0001794C, 0x07FF
+    .word 0x0001794E, 0x07FF
+    .word 0x00016154, 0x07FF
+    .word 0x00016156, 0x07FF
+    .word 0x00016158, 0x07FF
+    .word 0x0001615A, 0x07FF
+    .word 0x00016554, 0x07FF
+    .word 0x0001655C, 0x07FF
+    .word 0x00016954, 0x07FF
+    .word 0x0001695C, 0x07FF
+    .word 0x00016D54, 0x07FF
+    .word 0x00016D56, 0x07FF
+    .word 0x00016D58, 0x07FF
+    .word 0x00016D5A, 0x07FF
+    .word 0x00017154, 0x07FF
+    .word 0x00017554, 0x07FF
+    .word 0x00017954, 0x07FF
+    .word 0x00016162, 0x07FF
+    .word 0x00016164, 0x07FF
+    .word 0x00016166, 0x07FF
+    .word 0x00016560, 0x07FF
+    .word 0x00016568, 0x07FF
+    .word 0x00016960, 0x07FF
+    .word 0x00016968, 0x07FF
+    .word 0x00016D60, 0x07FF
+    .word 0x00016D62, 0x07FF
+    .word 0x00016D64, 0x07FF
+    .word 0x00016D66, 0x07FF
+    .word 0x00016D68, 0x07FF
+    .word 0x00017160, 0x07FF
+    .word 0x00017168, 0x07FF
+    .word 0x00017560, 0x07FF
+    .word 0x00017568, 0x07FF
+    .word 0x00017960, 0x07FF
+    .word 0x00017968, 0x07FF
+    .word 0x0001616E, 0x07FF
+    .word 0x00016170, 0x07FF
+    .word 0x00016172, 0x07FF
+    .word 0x00016174, 0x07FF
+    .word 0x0001656C, 0x07FF
+    .word 0x0001696C, 0x07FF
+    .word 0x00016D6C, 0x07FF
+    .word 0x0001716C, 0x07FF
+    .word 0x0001756C, 0x07FF
+    .word 0x0001796E, 0x07FF
+    .word 0x00017970, 0x07FF
+    .word 0x00017972, 0x07FF
+    .word 0x00017974, 0x07FF
+    .word 0x00016178, 0x07FF
+    .word 0x0001617A, 0x07FF
+    .word 0x0001617C, 0x07FF
+    .word 0x0001617E, 0x07FF
+    .word 0x00016180, 0x07FF
+    .word 0x00016578, 0x07FF
+    .word 0x00016978, 0x07FF
+    .word 0x00016D78, 0x07FF
+    .word 0x00016D7A, 0x07FF
+    .word 0x00016D7C, 0x07FF
+    .word 0x00016D7E, 0x07FF
+    .word 0x00017178, 0x07FF
+    .word 0x00017578, 0x07FF
+    .word 0x00017978, 0x07FF
+    .word 0x0001797A, 0x07FF
+    .word 0x0001797C, 0x07FF
+    .word 0x0001797E, 0x07FF
+    .word 0x00017980, 0x07FF
+    .word 0x0001B112, 0xFFFF
+    .word 0x0001B114, 0xFFFF
+    .word 0x0001B116, 0xFFFF
+    .word 0x0001B118, 0xFFFF
+    .word 0x0001B11A, 0xFFFF
+    .word 0x0001B516, 0xFFFF
+    .word 0x0001B916, 0xFFFF
+    .word 0x0001BD16, 0xFFFF
+    .word 0x0001C116, 0xFFFF
+    .word 0x0001C516, 0xFFFF
+    .word 0x0001C916, 0xFFFF
+    .word 0x0001B120, 0xFFFF
+    .word 0x0001B122, 0xFFFF
+    .word 0x0001B124, 0xFFFF
+    .word 0x0001B51E, 0xFFFF
+    .word 0x0001B526, 0xFFFF
+    .word 0x0001B91E, 0xFFFF
+    .word 0x0001B926, 0xFFFF
+    .word 0x0001BD1E, 0xFFFF
+    .word 0x0001BD26, 0xFFFF
+    .word 0x0001C11E, 0xFFFF
+    .word 0x0001C126, 0xFFFF
+    .word 0x0001C51E, 0xFFFF
+    .word 0x0001C526, 0xFFFF
+    .word 0x0001C920, 0xFFFF
+    .word 0x0001C922, 0xFFFF
+    .word 0x0001C924, 0xFFFF
+    .word 0x0001B138, 0xFFFF
+    .word 0x0001B13A, 0xFFFF
+    .word 0x0001B13C, 0xFFFF
+    .word 0x0001B13E, 0xFFFF
+    .word 0x0001B536, 0xFFFF
+    .word 0x0001B936, 0xFFFF
+    .word 0x0001BD38, 0xFFFF
+    .word 0x0001BD3A, 0xFFFF
+    .word 0x0001BD3C, 0xFFFF
+    .word 0x0001C13E, 0xFFFF
+    .word 0x0001C53E, 0xFFFF
+    .word 0x0001C936, 0xFFFF
+    .word 0x0001C938, 0xFFFF
+    .word 0x0001C93A, 0xFFFF
+    .word 0x0001C93C, 0xFFFF
+    .word 0x0001B142, 0xFFFF
+    .word 0x0001B144, 0xFFFF
+    .word 0x0001B146, 0xFFFF
+    .word 0x0001B148, 0xFFFF
+    .word 0x0001B14A, 0xFFFF
+    .word 0x0001B546, 0xFFFF
+    .word 0x0001B946, 0xFFFF
+    .word 0x0001BD46, 0xFFFF
+    .word 0x0001C146, 0xFFFF
+    .word 0x0001C546, 0xFFFF
+    .word 0x0001C946, 0xFFFF
+    .word 0x0001B150, 0xFFFF
+    .word 0x0001B152, 0xFFFF
+    .word 0x0001B154, 0xFFFF
+    .word 0x0001B54E, 0xFFFF
+    .word 0x0001B556, 0xFFFF
+    .word 0x0001B94E, 0xFFFF
+    .word 0x0001B956, 0xFFFF
+    .word 0x0001BD4E, 0xFFFF
+    .word 0x0001BD50, 0xFFFF
+    .word 0x0001BD52, 0xFFFF
+    .word 0x0001BD54, 0xFFFF
+    .word 0x0001BD56, 0xFFFF
+    .word 0x0001C14E, 0xFFFF
+    .word 0x0001C156, 0xFFFF
+    .word 0x0001C54E, 0xFFFF
+    .word 0x0001C556, 0xFFFF
+    .word 0x0001C94E, 0xFFFF
+    .word 0x0001C956, 0xFFFF
+    .word 0x0001B15A, 0xFFFF
+    .word 0x0001B15C, 0xFFFF
+    .word 0x0001B15E, 0xFFFF
+    .word 0x0001B160, 0xFFFF
+    .word 0x0001B55A, 0xFFFF
+    .word 0x0001B562, 0xFFFF
+    .word 0x0001B95A, 0xFFFF
+    .word 0x0001B962, 0xFFFF
+    .word 0x0001BD5A, 0xFFFF
+    .word 0x0001BD5C, 0xFFFF
+    .word 0x0001BD5E, 0xFFFF
+    .word 0x0001BD60, 0xFFFF
+    .word 0x0001C15A, 0xFFFF
+    .word 0x0001C15E, 0xFFFF
+    .word 0x0001C55A, 0xFFFF
+    .word 0x0001C560, 0xFFFF
+    .word 0x0001C95A, 0xFFFF
+    .word 0x0001C962, 0xFFFF
+    .word 0x0001B166, 0xFFFF
+    .word 0x0001B168, 0xFFFF
+    .word 0x0001B16A, 0xFFFF
+    .word 0x0001B16C, 0xFFFF
+    .word 0x0001B16E, 0xFFFF
+    .word 0x0001B56A, 0xFFFF
+    .word 0x0001B96A, 0xFFFF
+    .word 0x0001BD6A, 0xFFFF
+    .word 0x0001C16A, 0xFFFF
+    .word 0x0001C56A, 0xFFFF
+    .word 0x0001C96A, 0xFFFF
+    .word 0x000208C4, 0x4208
+    .word 0x000208CC, 0x4208
+    .word 0x00020CC4, 0x4208
+    .word 0x00020CCC, 0x4208
+    .word 0x000210C4, 0x4208
+    .word 0x000210CC, 0x4208
+    .word 0x000214C4, 0x4208
+    .word 0x000214C8, 0x4208
+    .word 0x000214CC, 0x4208
+    .word 0x000218C4, 0x4208
+    .word 0x000218C8, 0x4208
+    .word 0x000218CC, 0x4208
+    .word 0x00021CC4, 0x4208
+    .word 0x00021CC6, 0x4208
+    .word 0x00021CCA, 0x4208
+    .word 0x00021CCC, 0x4208
+    .word 0x000220C4, 0x4208
+    .word 0x000220CC, 0x4208
+    .word 0x000208D2, 0x4208
+    .word 0x000208D4, 0x4208
+    .word 0x000208D6, 0x4208
+    .word 0x00020CD0, 0x4208
+    .word 0x00020CD8, 0x4208
+    .word 0x000210D0, 0x4208
+    .word 0x000210D8, 0x4208
+    .word 0x000214D0, 0x4208
+    .word 0x000214D2, 0x4208
+    .word 0x000214D4, 0x4208
+    .word 0x000214D6, 0x4208
+    .word 0x000214D8, 0x4208
+    .word 0x000218D0, 0x4208
+    .word 0x000218D8, 0x4208
+    .word 0x00021CD0, 0x4208
+    .word 0x00021CD8, 0x4208
+    .word 0x000220D0, 0x4208
+    .word 0x000220D8, 0x4208
+    .word 0x000208DC, 0x4208
+    .word 0x000208DE, 0x4208
+    .word 0x000208E0, 0x4208
+    .word 0x000208E2, 0x4208
+    .word 0x00020CDC, 0x4208
+    .word 0x00020CE4, 0x4208
+    .word 0x000210DC, 0x4208
+    .word 0x000210E4, 0x4208
+    .word 0x000214DC, 0x4208
+    .word 0x000214DE, 0x4208
+    .word 0x000214E0, 0x4208
+    .word 0x000214E2, 0x4208
+    .word 0x000218DC, 0x4208
+    .word 0x000218E0, 0x4208
+    .word 0x00021CDC, 0x4208
+    .word 0x00021CE2, 0x4208
+    .word 0x000220DC, 0x4208
+    .word 0x000220E4, 0x4208
+    .word 0x000208E8, 0x4208
+    .word 0x000208EA, 0x4208
+    .word 0x000208EC, 0x4208
+    .word 0x000208EE, 0x4208
+    .word 0x00020CE8, 0x4208
+    .word 0x00020CF0, 0x4208
+    .word 0x000210E8, 0x4208
+    .word 0x000210F0, 0x4208
+    .word 0x000214E8, 0x4208
+    .word 0x000214EA, 0x4208
+    .word 0x000214EC, 0x4208
+    .word 0x000214EE, 0x4208
+    .word 0x000218E8, 0x4208
+    .word 0x00021CE8, 0x4208
+    .word 0x000220E8, 0x4208
+    .word 0x00020900, 0x4208
+    .word 0x00020902, 0x4208
+    .word 0x00020904, 0x4208
+    .word 0x00020906, 0x4208
+    .word 0x00020908, 0x4208
+    .word 0x00020D00, 0x4208
+    .word 0x00021100, 0x4208
+    .word 0x00021500, 0x4208
+    .word 0x00021502, 0x4208
+    .word 0x00021504, 0x4208
+    .word 0x00021506, 0x4208
+    .word 0x00021900, 0x4208
+    .word 0x00021D00, 0x4208
+    .word 0x00022100, 0x4208
+    .word 0x0002090C, 0x4208
+    .word 0x00020D0C, 0x4208
+    .word 0x0002110C, 0x4208
+    .word 0x0002150C, 0x4208
+    .word 0x0002190C, 0x4208
+    .word 0x00021D0C, 0x4208
+    .word 0x0002210C, 0x4208
+    .word 0x0002210E, 0x4208
+    .word 0x00022110, 0x4208
+    .word 0x00022112, 0x4208
+    .word 0x00022114, 0x4208
+    .word 0x0002091A, 0x4208
+    .word 0x0002091C, 0x4208
+    .word 0x0002091E, 0x4208
+    .word 0x00020D1C, 0x4208
+    .word 0x0002111C, 0x4208
+    .word 0x0002151C, 0x4208
+    .word 0x0002191C, 0x4208
+    .word 0x00021D1C, 0x4208
+    .word 0x0002211A, 0x4208
+    .word 0x0002211C, 0x4208
+    .word 0x0002211E, 0x4208
+    .word 0x00020926, 0x4208
+    .word 0x00020928, 0x4208
+    .word 0x0002092A, 0x4208
+    .word 0x0002092C, 0x4208
+    .word 0x00020D24, 0x4208
+    .word 0x00021124, 0x4208
+    .word 0x00021524, 0x4208
+    .word 0x00021528, 0x4208
+    .word 0x0002152A, 0x4208
+    .word 0x0002152C, 0x4208
+    .word 0x00021924, 0x4208
+    .word 0x0002192C, 0x4208
+    .word 0x00021D24, 0x4208
+    .word 0x00021D2C, 0x4208
+    .word 0x00022126, 0x4208
+    .word 0x00022128, 0x4208
+    .word 0x0002212A, 0x4208
+    .word 0x0002212C, 0x4208
+    .word 0x00020930, 0x4208
+    .word 0x00020938, 0x4208
+    .word 0x00020D30, 0x4208
+    .word 0x00020D38, 0x4208
+    .word 0x00021130, 0x4208
+    .word 0x00021138, 0x4208
+    .word 0x00021530, 0x4208
+    .word 0x00021532, 0x4208
+    .word 0x00021534, 0x4208
+    .word 0x00021536, 0x4208
+    .word 0x00021538, 0x4208
+    .word 0x00021930, 0x4208
+    .word 0x00021938, 0x4208
+    .word 0x00021D30, 0x4208
+    .word 0x00021D38, 0x4208
+    .word 0x00022130, 0x4208
+    .word 0x00022138, 0x4208
+    .word 0x0002093C, 0x4208
+    .word 0x0002093E, 0x4208
+    .word 0x00020940, 0x4208
+    .word 0x00020942, 0x4208
+    .word 0x00020944, 0x4208
+    .word 0x00020D40, 0x4208
+    .word 0x00021140, 0x4208
+    .word 0x00021540, 0x4208
+    .word 0x00021940, 0x4208
+    .word 0x00021D40, 0x4208
+    .word 0x00022140, 0x4208
+    .word 0x00020956, 0x4208
+    .word 0x00020958, 0x4208
+    .word 0x0002095A, 0x4208
+    .word 0x0002095C, 0x4208
+    .word 0x00020D54, 0x4208
+    .word 0x00021154, 0x4208
+    .word 0x00021556, 0x4208
+    .word 0x00021558, 0x4208
+    .word 0x0002155A, 0x4208
+    .word 0x0002195C, 0x4208
+    .word 0x00021D5C, 0x4208
+    .word 0x00022154, 0x4208
+    .word 0x00022156, 0x4208
+    .word 0x00022158, 0x4208
+    .word 0x0002215A, 0x4208
+    .word 0x00020962, 0x4208
+    .word 0x00020964, 0x4208
+    .word 0x00020966, 0x4208
+    .word 0x00020D64, 0x4208
+    .word 0x00021164, 0x4208
+    .word 0x00021564, 0x4208
+    .word 0x00021964, 0x4208
+    .word 0x00021D64, 0x4208
+    .word 0x00022162, 0x4208
+    .word 0x00022164, 0x4208
+    .word 0x00022166, 0x4208
+    .word 0x0002096C, 0x4208
+    .word 0x00020974, 0x4208
+    .word 0x00020D6C, 0x4208
+    .word 0x00020D6E, 0x4208
+    .word 0x00020D72, 0x4208
+    .word 0x00020D74, 0x4208
+    .word 0x0002116C, 0x4208
+    .word 0x00021170, 0x4208
+    .word 0x00021174, 0x4208
+    .word 0x0002156C, 0x4208
+    .word 0x00021574, 0x4208
+    .word 0x0002196C, 0x4208
+    .word 0x00021974, 0x4208
+    .word 0x00021D6C, 0x4208
+    .word 0x00021D74, 0x4208
+    .word 0x0002216C, 0x4208
+    .word 0x00022174, 0x4208
+    .word 0x00020978, 0x4208
+    .word 0x00020980, 0x4208
+    .word 0x00020D78, 0x4208
+    .word 0x00020D80, 0x4208
+    .word 0x00021178, 0x4208
+    .word 0x00021180, 0x4208
+    .word 0x00021578, 0x4208
+    .word 0x00021580, 0x4208
+    .word 0x00021978, 0x4208
+    .word 0x00021980, 0x4208
+    .word 0x00021D78, 0x4208
+    .word 0x00021D80, 0x4208
+    .word 0x0002217A, 0x4208
+    .word 0x0002217C, 0x4208
+    .word 0x0002217E, 0x4208
+    .word 0x00020984, 0x4208
+    .word 0x00020D84, 0x4208
+    .word 0x00021184, 0x4208
+    .word 0x00021584, 0x4208
+    .word 0x00021984, 0x4208
+    .word 0x00021D84, 0x4208
+    .word 0x00022184, 0x4208
+    .word 0x00022186, 0x4208
+    .word 0x00022188, 0x4208
+    .word 0x0002218A, 0x4208
+    .word 0x0002218C, 0x4208
+    .word 0x00020992, 0x4208
+    .word 0x00020994, 0x4208
+    .word 0x00020996, 0x4208
+    .word 0x00020D90, 0x4208
+    .word 0x00020D98, 0x4208
+    .word 0x00021190, 0x4208
+    .word 0x00021198, 0x4208
+    .word 0x00021590, 0x4208
+    .word 0x00021592, 0x4208
+    .word 0x00021594, 0x4208
+    .word 0x00021596, 0x4208
+    .word 0x00021598, 0x4208
+    .word 0x00021990, 0x4208
+    .word 0x00021998, 0x4208
+    .word 0x00021D90, 0x4208
+    .word 0x00021D98, 0x4208
+    .word 0x00022190, 0x4208
+    .word 0x00022198, 0x4208
+    .word 0x0002099C, 0x4208
+    .word 0x0002099E, 0x4208
+    .word 0x000209A0, 0x4208
+    .word 0x000209A2, 0x4208
+    .word 0x000209A4, 0x4208
+    .word 0x00020DA0, 0x4208
+    .word 0x000211A0, 0x4208
+    .word 0x000215A0, 0x4208
+    .word 0x000219A0, 0x4208
+    .word 0x00021DA0, 0x4208
+    .word 0x000221A0, 0x4208
+    .word 0x000209AA, 0x4208
+    .word 0x000209AC, 0x4208
+    .word 0x000209AE, 0x4208
+    .word 0x00020DA8, 0x4208
+    .word 0x00020DB0, 0x4208
+    .word 0x000211A8, 0x4208
+    .word 0x000211B0, 0x4208
+    .word 0x000215A8, 0x4208
+    .word 0x000215B0, 0x4208
+    .word 0x000219A8, 0x4208
+    .word 0x000219B0, 0x4208
+    .word 0x00021DA8, 0x4208
+    .word 0x00021DB0, 0x4208
+    .word 0x000221AA, 0x4208
+    .word 0x000221AC, 0x4208
+    .word 0x000221AE, 0x4208
+    .word 0x000209B4, 0x4208
+    .word 0x000209B6, 0x4208
+    .word 0x000209B8, 0x4208
+    .word 0x000209BA, 0x4208
+    .word 0x00020DB4, 0x4208
+    .word 0x00020DBC, 0x4208
+    .word 0x000211B4, 0x4208
+    .word 0x000211BC, 0x4208
+    .word 0x000215B4, 0x4208
+    .word 0x000215B6, 0x4208
+    .word 0x000215B8, 0x4208
+    .word 0x000215BA, 0x4208
+    .word 0x000219B4, 0x4208
+    .word 0x000219B8, 0x4208
+    .word 0x00021DB4, 0x4208
+    .word 0x00021DBA, 0x4208
+    .word 0x000221B4, 0x4208
+    .word 0x000221BC, 0x4208
+splash_text_end:
 
 @ ---- Tabla de Órbita de Turbulencia (8 pasos, valores ±1) --
 @ Produce un leve movimiento oscilante tipo "flote espacial"
