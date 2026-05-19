@@ -9,7 +9,6 @@
 .equ FB_BASE,  0xC8000000
 
 @ Colores fondo
-.equ C_BLACK,  0x0000
 .equ C_WHITE,  0xFFFF
 .equ C_BLUE_P, 0x9CF3
 .equ C_YELLOW, 0xFFE0
@@ -591,10 +590,8 @@ SERVICE_IRQ:
     B    EXIT_IRQ
 IRQ_CHK_PS2:
     CMP  R5, #79
-    BNE  IRQ_OTHER
+    BNE  EXIT_IRQ
     BL   PS2_ISR
-    B    EXIT_IRQ
-IRQ_OTHER:
 EXIT_IRQ:
     STR  R5, [R4, #0x10]
     POP  {R0-R7, LR}
@@ -684,9 +681,6 @@ TI_END:
 @ ============================================================
 
 @ Constantes auxiliares
-.equ W_STRIDE,  1024    @ bytes por fila
-.equ W_WIDTH,   320
-.equ W_HEIGHT,  240
 .equ W_CX,      160     @ centro X
 .equ W_CY,      120     @ centro Y
 .equ C_WGRAY,   0x632C  @ gris azulado para cola
@@ -883,6 +877,8 @@ WAIT_FOR_SPACE:
 WFS_LOOP:
     @ --- Animar el fondo warp (estrellas moviendose) ---
     BL   UPDATE_WARP
+    @ --- Repintar el texto del splash encima del fondo animado ---
+    BL   DRAW_SPLASH
     @ --- Delay pequeño para controlar velocidad de animación ---
     LDR  R0, =300000
 WFS_DELAY:
@@ -915,8 +911,8 @@ CLEAR_SPLASH:
 CS_LOOP:
     CMP  R0, R1
     BGE  CS_DONE
-    LDR  R2, [R0], #4           @ offset en FB
-    ADD  R0, R0, #4             @ saltar color
+    LDR  R2, [R0], #4           @ offset en FB (post-inc avanza 4)
+    LDR  R3, [R0], #4           @ leer (y descartar) color, avanzar 4
     ADD  R2, R2, R4
     MOV  R3, #0                 @ negro
     STRH R3, [R2]
@@ -929,8 +925,6 @@ CS_DONE:
 @ ============================================================
 @ PS2_ISR 
 @ ============================================================
-.equ STEP, 4
-
 .global PS2_ISR
 PS2_ISR:
     PUSH {R0-R5, LR}
