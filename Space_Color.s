@@ -18,6 +18,16 @@
 .equ SHIP_W,  32
 .equ SHIP_H,  36
 
+@ ---- Proyectiles láser -----------------------------------------
+.equ MAX_BULLETS,   4           @ máximo de balas activas simultáneas
+.equ BULLET_SPEED,  14          @ píxeles por tick hacia arriba (rápido)
+.equ BULLET_H,      8           @ altura de la barra láser en píxeles
+.equ C_LASER_CORE,  0xFFFF      @ blanco (núcleo central)
+.equ C_LASER_MID,   0xF800      @ rojo brillante (cuerpo)
+.equ C_LASER_TAIL,  0x8000      @ rojo oscuro (cola)
+@ Scancode PS/2 de la tecla "X" (sin E0)
+.equ SC_X,          0x22
+
 @ ============================================================
 @ TABLA DE VECTORES
 @ ============================================================
@@ -91,6 +101,13 @@ _start:
     STR  R1, [R0]
     LDR  R0, =warp_flag
     STR  R1, [R0]
+
+    @ ---- Inicializar flag de tecla X y balas ------------------
+    LDR  R0, =key_x
+    STR  R1, [R0]
+    LDR  R0, =fire_request
+    STR  R1, [R0]
+    BL   INIT_BULLETS
 
     @ ---- Guardar fondo y pintar nave por primera vez -------
     BL   SAVE_BG
@@ -259,6 +276,18 @@ DO_WARP_SCROLL:
     BL   DRAW_SHIP
 
 MAIN_WAIT:
+    @ ---- Disparar si se presionó X ---------------------------
+    LDR  R0, =fire_request
+    LDR  R1, [R0]
+    CMP  R1, #1
+    BNE  ML_NO_FIRE
+    MOV  R1, #0
+    STR  R1, [R0]
+    BL   FIRE_BULLET
+ML_NO_FIRE:
+    @ ---- Actualizar proyectiles activos ----------------------
+    BL   UPDATE_BULLETS
+
     BL   DELAY
     B    MAIN_LOOP
 
@@ -275,8 +304,179 @@ DELAY_LOOP:
     BX   LR
 
 @ ============================================================
-@ DRAW_SHIP
+@ INIT_BULLETS  -  Marca todos los slots como inactivos (active=0)
+@ Estructura de cada bala (3 words):
+@   [0] active  (0=libre, 1=en vuelo)
+@   [1] x       posición X (centro del láser)
+@   [2] y       posición Y (cabeza del láser)
 @ ============================================================
+INIT_BULLETS:
+    PUSH {R0-R2, LR}
+    LDR  R0, =bullets
+    MOV  R1, #0
+    MOV  R2, #MAX_BULLETS
+IB_LOOP:
+    CMP  R2, #0
+    BEQ  IB_DONE
+    STR  R1, [R0]        @ active = 0
+    ADD  R0, R0, #12     @ siguiente slot (3 words)
+    SUB  R2, R2, #1
+    B    IB_LOOP
+IB_DONE:
+    POP  {R0-R2, LR}
+    BX   LR
+
+@ ============================================================
+@ FIRE_BULLET  -  Busca un slot libre y lanza una bala desde
+@                 el centro superior de la nave.
+@ ============================================================
+FIRE_BULLET:
+    PUSH {R0-R5, LR}
+    LDR  R0, =bullets
+    MOV  R5, #MAX_BULLETS
+FB_FIND:
+    CMP  R5, #0
+    BEQ  FB_DONE          @ no hay slots libres
+    LDR  R1, [R0]         @ active?
+    CMP  R1, #0
+    BEQ  FB_FOUND
+    ADD  R0, R0, #12
+    SUB  R5, R5, #1
+    B    FB_FIND
+FB_FOUND:
+    @ Posición X = ship_x + SHIP_W/2 (centro horizontal = +16)
+    LDR  R2, =ship_x
+    LDR  R2, [R2]
+    ADD  R2, R2, #16      @ centro X de la nave
+    @ Posición Y = ship_y (parte superior de la nave)
+    LDR  R3, =ship_y
+    LDR  R3, [R3]
+    @ Activar bala
+    MOV  R1, #1
+    STR  R1, [R0]         @ active = 1
+    STR  R2, [R0, #4]     @ x
+    STR  R3, [R0, #8]     @ y
+FB_DONE:
+    POP  {R0-R5, LR}
+    BX   LR
+
+@ ============================================================
+@ UPDATE_BULLETS  -  Mueve todas las balas activas hacia arriba,
+@                    las dibuja y borra las que salen de pantalla.
+@ Registros:
+@   R4 = puntero al slot actual
+@   R5 = FB_BASE
+@   R6 = x
+@   R7 = y
+@   R8 = contador de slots restantes
+@ ============================================================
+UPDATE_BULLETS:
+    PUSH {R4-R10, LR}
+    LDR  R4, =bullets
+    LDR  R5, =FB_BASE
+    MOV  R8, #MAX_BULLETS
+
+UB_LOOP:
+    CMP  R8, #0
+    BEQ  UB_DONE
+
+    LDR  R0, [R4]         @ active?
+    CMP  R0, #0
+    BEQ  UB_NEXT
+
+    LDR  R6, [R4, #4]     @ x (centro)
+    LDR  R7, [R4, #8]     @ y (cabeza)
+
+    @ --- Borrar barra anterior: BULLET_H filas × 3 columnas ---
+    @ columnas: x-1, x, x+1  (3px ancho)
+    @ filas: y .. y+BULLET_H-1
+    MOV  R9, #0            @ fila relativa = 0
+UB_ERASE_ROW:
+    CMP  R9, #BULLET_H
+    BGE  UB_ERASE_DONE
+    ADD  R10, R7, R9       @ fila abs = y + offset
+    CMP  R10, #0
+    BLT  UB_ERASE_NEXT_ROW
+    CMP  R10, #239
+    BGT  UB_ERASE_NEXT_ROW
+    LSL  R0, R10, #10
+    ADD  R0, R0, R6, LSL #1   @ base pixel central
+    ADD  R0, R0, R5
+    MOV  R1, #0
+    STRH R1, [R0, #-2]    @ x-1
+    STRH R1, [R0]          @ x
+    STRH R1, [R0, #2]      @ x+1
+UB_ERASE_NEXT_ROW:
+    ADD  R9, R9, #1
+    B    UB_ERASE_ROW
+UB_ERASE_DONE:
+
+    @ --- Mover bala hacia arriba ---
+    SUB  R7, R7, #BULLET_SPEED
+
+    @ --- Verificar límite superior ---
+    CMP  R7, #0
+    BLT  UB_DEACTIVATE
+
+    @ --- Actualizar Y en memoria ---
+    STR  R7, [R4, #8]
+
+    @ --- Dibujar barra vertical: 8 filas × 3 columnas ---
+    @ Fila 0-1: núcleo blanco (cabeza)
+    @ Fila 2-5: rojo brillante (cuerpo)
+    @ Fila 6-7: rojo oscuro (cola)
+    MOV  R9, #0
+UB_DRAW_ROW:
+    CMP  R9, #BULLET_H
+    BGE  UB_NEXT
+
+    ADD  R10, R7, R9       @ fila abs
+    CMP  R10, #0
+    BLT  UB_DRAW_NEXT_ROW
+    CMP  R10, #239
+    BGT  UB_DRAW_NEXT_ROW
+
+    @ Elegir color según fila relativa
+    CMP  R9, #2
+    BLT  UB_COL_CORE       @ filas 0-1: blanco
+    CMP  R9, #6
+    BLT  UB_COL_MID        @ filas 2-5: rojo brillante
+    B    UB_COL_TAIL        @ filas 6-7: rojo oscuro
+UB_COL_CORE:
+    LDR  R1, =C_LASER_CORE
+    B    UB_DO_DRAW
+UB_COL_MID:
+    LDR  R1, =C_LASER_MID
+    B    UB_DO_DRAW
+UB_COL_TAIL:
+    LDR  R1, =C_LASER_TAIL
+
+UB_DO_DRAW:
+    LSL  R0, R10, #10
+    ADD  R0, R0, R6, LSL #1
+    ADD  R0, R0, R5
+    STRH R1, [R0, #-2]    @ x-1
+    STRH R1, [R0]          @ x
+    STRH R1, [R0, #2]      @ x+1
+
+UB_DRAW_NEXT_ROW:
+    ADD  R9, R9, #1
+    B    UB_DRAW_ROW
+
+UB_DEACTIVATE:
+    MOV  R1, #0
+    STR  R1, [R4]            @ active = 0
+
+UB_NEXT:
+    ADD  R4, R4, #12
+    SUB  R8, R8, #1
+    B    UB_LOOP
+
+UB_DONE:
+    POP  {R4-R10, LR}
+    BX   LR
+
+
 DRAW_SHIP:
     PUSH {R4-R10, LR}
     LDR  R4, =FB_BASE
@@ -954,17 +1154,33 @@ PS2_NO_BREAK:
     B    PS2_END
 
 PS2_NO_F0:
+    @ ---- Detectar tecla X (scancode 0x22, sin E0) make-code --
+    @ Si llegamos aquí, break_flag=0 y no es 0xF0
+    @ Comprobar si es la tecla X (make code sin E0)
     LDR  R1, =e0_flag_ps2
     LDR  R2, [R1]
     CMP  R2, #1
-    BEQ  PS2_EXT_MAKE
+    BEQ  PS2_EXT_PATH     @ si hay E0 pendiente, ir a ruta extendida
 
+    CMP  R0, #SC_X        @ ¿es la tecla X?
+    BNE  PS2_CHECK_E0
+    @ Tecla X presionada (make): disparar
+    LDR  R1, =fire_request
+    MOV  R2, #1
+    STR  R2, [R1]
+    LDR  R1, =key_x
+    STR  R2, [R1]
+    B    PS2_END
+
+PS2_CHECK_E0:
     CMP  R0, #0xE0
     BNE  PS2_END
+    LDR  R1, =e0_flag_ps2
     MOV  R2, #1
     STR  R2, [R1]
     B    PS2_END
 
+PS2_EXT_PATH:
 PS2_EXT_MAKE:
     MOV  R2, #0
     STR  R2, [R1]
@@ -1007,8 +1223,14 @@ SKF_TRY_LEFT:
     B    SKF_END
 SKF_TRY_RIGHT:
     CMP  R0, #0x74              @ RIGHT
-    BNE  SKF_END
+    BNE  SKF_TRY_X
     LDR  R3, =key_right
+    STR  R4, [R3]
+    B    SKF_END
+SKF_TRY_X:
+    CMP  R0, #SC_X              @ X (break code de X llega aquí si break_flag=1)
+    BNE  SKF_END
+    LDR  R3, =key_x
     STR  R4, [R3]
 SKF_END:
     POP  {R3-R4, LR}
@@ -1054,6 +1276,7 @@ key_up:        .word 0
 key_down:      .word 0
 key_left:      .word 0
 key_right:     .word 0
+key_x:         .word 0          @ 1 = tecla X presionada
 e0_flag_ps2:   .word 0
 break_flag:    .word 0
 anim_frame:    .word 0
@@ -1061,6 +1284,13 @@ redraw_flag:   .word 0
 turb_tick:     .word 0
 turb_phase:    .word 0
 warp_flag:     .word 0          @ 1 = actualizar warp este tick
+fire_request:  .word 0          @ 1 = disparar en el próximo tick
+
+@ ---- Tabla de proyectiles láser (MAX_BULLETS slots × 3 words) -
+@ Formato por slot: active, x, y
+.align 2
+bullets:
+    .skip 48                    @ 4 slots × 3 words × 4 bytes
 
 @ ============================================================
 @ TABLA DE RAYOS WARP  (24 rayos × 5 words)
